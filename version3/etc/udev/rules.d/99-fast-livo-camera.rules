@@ -1,1 +1,0 @@
-SUBSYSTEM=="video4linux", ATTRS{idVendor}=="32e4", ATTRS{idProduct}=="05b1", SYMLINK+="fast_livo_camera", MODE="0666"
