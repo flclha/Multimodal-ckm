@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+IMAGE_SYMLINK="/dev/fast_livo_camera"
+METADATA_SYMLINK="/dev/fast_livo_camera_metadata"
+TIMEOUT="${1:-45}"
+DEADLINE=$((SECONDS + TIMEOUT))
+
+sudo modprobe uvcvideo || true
+sudo udevadm trigger || true
+sudo udevadm settle --timeout=5 || true
+
+pick_global_shutter_node() {
+  local wanted_index="$1"
+  local cand
+  local props
+  local index
+
+  for cand in /dev/v4l/by-id/usb-Global_Shutter_Camera_*-video-index"$wanted_index"; do
+    [[ -e "$cand" ]] || continue
+    readlink -f "$cand"
+    return 0
+  done
+
+  for cand in /dev/video*; do
+    [[ -e "$cand" ]] || continue
+    props="$(udevadm info -q property -n "$cand" 2>/dev/null || true)"
+    index="$(cat "/sys/class/video4linux/${cand##*/}/index" 2>/dev/null || true)"
+    if grep -q '^ID_VENDOR_ID=32e4$' <<<"$props" &&
+       grep -q '^ID_MODEL_ID=05b1$' <<<"$props" &&
+       [[ "$index" == "$wanted_index" ]]; then
+      readlink -f "$cand"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+while (( SECONDS < DEADLINE )); do
+  sudo udevadm settle --timeout=2 || true
+  image_dev="$(pick_global_shutter_node 0 || true)"
+  metadata_dev="$(pick_global_shutter_node 1 || true)"
+  if [[ -n "${image_dev:-}" && -n "${metadata_dev:-}" ]]; then
+    sudo ln -sfn "$image_dev" "$IMAGE_SYMLINK"
+    sudo ln -sfn "$metadata_dev" "$METADATA_SYMLINK"
+    if [[ -e "$IMAGE_SYMLINK" && -e "$METADATA_SYMLINK" ]]; then
+      echo "FAST-LIVO RGB image ready: $IMAGE_SYMLINK -> $(readlink -f "$IMAGE_SYMLINK")"
+      echo "FAST-LIVO RGB metadata ready: $METADATA_SYMLINK -> $(readlink -f "$METADATA_SYMLINK")"
+      exit 0
+    fi
+  fi
+  sleep 1
+done
+
+echo "ERROR: original Global Shutter RGB image/metadata pair did not become ready within ${TIMEOUT}s" >&2
+echo "Debug info:" >&2
+lsusb >&2 || true
+ls -l /dev/video* >&2 || true
+ls -l /dev/v4l/by-id >&2 || true
+ls -l /dev/v4l/by-path >&2 || true
+dmesg | tail -n 80 >&2 || true
+exit 1

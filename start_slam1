@@ -1,0 +1,714 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Wait until the USB camera is fully enumerated after reboot. Keep the helper
+# in the repository so a fresh clone does not depend on /usr/local/bin.
+CAMERA_WAIT_HELPER="${CAMERA_WAIT_HELPER:-$SCRIPT_DIR/scripts/wait_fast_livo_camera}"
+[ -x "$CAMERA_WAIT_HELPER" ] || {
+  echo "ERROR: missing executable camera wait helper: $CAMERA_WAIT_HELPER" >&2
+  exit 1
+}
+"$CAMERA_WAIT_HELPER" "${CAMERA_ENUM_WAIT_SEC:-45}" || exit 1
+
+VERSION_ROOT="$SCRIPT_DIR"
+VERSION_WS="$VERSION_ROOT/catkin_ws"
+VERSION_SRC="$VERSION_WS/src"
+ROS_ENV="$VERSION_ROOT/ros_env.sh"
+LIVOX_WS="${LIVOX_WS:-$HOME/ws_livox}"
+GEMINI_WS="${GEMINI_WS:-$HOME/catkin_ws}"
+export VERSION_ROOT VERSION_WS VERSION_SRC ROS_ENV LIVOX_WS GEMINI_WS
+set +u
+source "$ROS_ENV"
+set -u
+echo "Isolated FAST-LIVO workspace: $VERSION_WS"
+echo "Resolved fast_livo package: $(rospack find fast_livo)"
+# Robust FAST-LIVO2 startup for MID360 + UVC camera on this NUC.
+# Usage:
+#   bash "$HOME/Desktop/start_slam1"
+# This script starts RViz by default on the NUC logged-in desktop.
+# If the physical UVC camera is missing, the script exits with an error.
+
+LOG_ROOT="$VERSION_ROOT/logs"
+FAST_LIVO_LOG_ROOT="$VERSION_SRC/FAST-LIVO2/Log"
+# Keep the old PCD root only for backward-compatible cleanup of legacy runs.
+PCD_DIR="$FAST_LIVO_LOG_ROOT/PCD"
+RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
+if ! [[ "$RUN_ID" =~ ^[0-9]{8}_[0-9]{6}$ ]]; then
+  echo "ERROR: RUN_ID must use YYYYMMDD_HHMMSS format: $RUN_ID" >&2
+  exit 2
+fi
+LOG_DIR="$LOG_ROOT/$RUN_ID"
+MULTIMODAL_DATASET_ROOT="$FAST_LIVO_LOG_ROOT/Multimodal_Dataset"
+DATASET_RUN_DIR="$MULTIMODAL_DATASET_ROOT/$RUN_ID"
+PCD_RUN_DIR="$DATASET_RUN_DIR/global/pcd_chunks"
+CAMERA_TIME_DIAG_CSV="${CAMERA_TIME_DIAG_CSV:-$LOG_DIR/pts_mid360.csv}"
+export FAST_LIVO_TIME_DIAG_CSV="$CAMERA_TIME_DIAG_CSV"
+RGB_COLOR_DIAG_CSV="${RGB_COLOR_DIAG_CSV:-$LOG_DIR/rgb_colorization.csv}"
+export FAST_LIVO_RGB_DIAG_CSV="$RGB_COLOR_DIAG_CSV"
+SENSOR_TIME_ALIGNMENT_REPORT="${SENSOR_TIME_ALIGNMENT_REPORT:-$LOG_DIR/sensor_time_alignment.txt}"
+SENSOR_TIME_ALIGNMENT_SAMPLE_SEC="${SENSOR_TIME_ALIGNMENT_SAMPLE_SEC:-3}"
+LIVOX_IP="192.168.1.50"
+LIVOX_IFACE="enp86s0"
+export LIVOX_IP
+CAMERA_DEV="${CAMERA_DEV:-}"
+CAMERA_STABLE_DEV="${CAMERA_STABLE_DEV:-/dev/fast_livo_camera}"
+CAMERA_METADATA_DEV="${CAMERA_METADATA_DEV:-}"
+CAMERA_METADATA_STABLE_DEV="${CAMERA_METADATA_STABLE_DEV:-/dev/fast_livo_camera_metadata}"
+START_GEMINI335L="${START_GEMINI335L:-1}"
+GEMINI_CAMERA_NAME="${GEMINI_CAMERA_NAME:-gemini335l}"
+GEMINI_DEPTH_MIN_MM="${GEMINI_DEPTH_MIN_MM:-300}"
+GEMINI_DEPTH_MAX_MM="${GEMINI_DEPTH_MAX_MM:-5000}"
+GEMINI_DATASET_SAVE_HZ="${GEMINI_DATASET_SAVE_HZ:-10.0}"
+RGB_DATASET_SAVE_HZ="${RGB_DATASET_SAVE_HZ:-10.0}"
+GEMINI_DATASET_QUEUE_SIZE="${GEMINI_DATASET_QUEUE_SIZE:-256}"
+GEMINI_DATASET_PNG_COMPRESSION="${GEMINI_DATASET_PNG_COMPRESSION:-1}"
+LIDAR_DATASET_QUEUE_SIZE="${LIDAR_DATASET_QUEUE_SIZE:-64}"
+# The new raw/rgb saver is authoritative. Disable the old COLMAP image copy by
+# default to avoid encoding and writing every 1920x1080 RGB frame twice.
+LEGACY_COLMAP_OUTPUT="${LEGACY_COLMAP_OUTPUT:-0}"
+START_RVIZ="${START_RVIZ:-1}"
+RVIZ_LAYOUT="${RVIZ_LAYOUT:-single}"
+USE_STM32_SERIAL_BRIDGE="${USE_STM32_SERIAL_BRIDGE:-0}"
+LIDAR_WAIT_SEC="${LIDAR_WAIT_SEC:-240}"
+IMU_WAIT_SEC="${IMU_WAIT_SEC:-30}"
+CAMERA_WAIT_SEC="${CAMERA_WAIT_SEC:-75}"
+
+mkdir -p "$LOG_ROOT" "$LOG_DIR" "$PCD_DIR" \
+  "$DATASET_RUN_DIR/raw/lidar" "$DATASET_RUN_DIR/raw/imu" \
+  "$DATASET_RUN_DIR/raw/rgb" "$DATASET_RUN_DIR/raw/pos" \
+  "$DATASET_RUN_DIR/raw/depth" "$DATASET_RUN_DIR/raw/ir_left" \
+  "$DATASET_RUN_DIR/raw/ir_right" "$DATASET_RUN_DIR/raw/channel" \
+  "$DATASET_RUN_DIR/global/config" "$PCD_RUN_DIR/lidar" "$PCD_RUN_DIR/merge"
+printf 'run_id=%s\nstarted_at=%s\nversion_root=%s\ndataset_dir=%s\n' \
+  "$RUN_ID" "$(date --iso-8601=seconds)" "$VERSION_ROOT" "$DATASET_RUN_DIR" \
+  > "$LOG_DIR/session_info.txt"
+
+# Mark sessions that were interrupted by power loss or hard reset.  A normal
+# stop_slam removes this marker after all queues and maps are safely flushed.
+while IFS= read -r stale_marker; do
+  stale_dir="$(dirname "$stale_marker")"
+  printf 'Previous session did not reach a clean stop_slam. Files may be incomplete.\n' \
+    > "$stale_dir/ABORTED_UNCLEAN_SHUTDOWN.txt"
+  rm -f "$stale_marker"
+done < <(find "$MULTIMODAL_DATASET_ROOT" -mindepth 2 -maxdepth 2 -name .recording -type f 2>/dev/null || true)
+printf 'run_id=%s\nstarted_at=%s\n' "$RUN_ID" "$(date --iso-8601=seconds)" > "$DATASET_RUN_DIR/.recording"
+
+COLMAP_DIR="$FAST_LIVO_LOG_ROOT/Colmap"
+COLMAP_IMAGE_DIR="$COLMAP_DIR/images"
+COLMAP_IMAGE_ARCHIVE_DIR="$COLMAP_IMAGE_DIR"
+COLMAP_RUN_DIR="$DATASET_RUN_DIR/global/colmap"
+COLMAP_RGB_DIR="$COLMAP_RUN_DIR/rgb"
+mkdir -p "$COLMAP_RGB_DIR"
+
+run_sudo() {
+  if sudo -n "$@" 2>/dev/null; then
+    return 0
+  elif [ -n "${SUDO_PASSWORD:-}" ]; then
+    printf '%s\n' "$SUDO_PASSWORD" | sudo -S -p '' "$@"
+  else
+    sudo "$@"
+  fi
+}
+
+start_colmap_image_archiver() {
+  # FAST-LIVO2 writes images to Log/Colmap/images directly.
+  # This background screen keeps the root clean by moving completed image files
+  # into Log/Colmap/<run_timestamp>/rgb during the run.
+  local run_dir="$1"
+  mkdir -p "$COLMAP_IMAGE_DIR" "$run_dir" "$LOG_DIR"
+  printf '%s\n' "$run_dir" > "$COLMAP_DIR/current_image_run.txt"
+
+  screen -S colmap_image_archiver -X quit >/dev/null 2>&1 || true
+  screen -L -Logfile "$LOG_DIR/colmap_image_archiver.log" -dmS colmap_image_archiver bash --noprofile --norc -c "
+    set -euo pipefail
+    image_dir='$COLMAP_IMAGE_DIR'
+    run_dir='$run_dir'
+    while true; do
+      now=\$(date +%s)
+      find \"\$image_dir\" -maxdepth 1 -type f \\( -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.bmp' -o -iname '*.tif' -o -iname '*.tiff' \\) -print0 \\
+        | while IFS= read -r -d '' f; do
+            mtime=\$(stat -c %Y \"\$f\" 2>/dev/null || echo \"\$now\")
+            if [ \$((now - mtime)) -ge 2 ]; then
+              mv -n \"\$f\" \"\$run_dir/\" 2>/dev/null || true
+            fi
+          done
+      sleep 2
+    done
+  "
+  echo "COLMAP images for this run will be moved into: $run_dir"
+}
+
+archive_colmap_images() {
+  # Archive existing root-level COLMAP images before a new run.
+  local tag="$1"
+  local ts
+  local out_dir
+  local count
+  ts="$(date +%Y%m%d_%H%M%S)"
+  out_dir="$COLMAP_IMAGE_ARCHIVE_DIR/${tag}_${ts}"
+
+  mkdir -p "$COLMAP_IMAGE_DIR" "$COLMAP_IMAGE_ARCHIVE_DIR"
+  count="$(find "$COLMAP_IMAGE_DIR" -maxdepth 1 -type f \( -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.bmp' -o -iname '*.tif' -o -iname '*.tiff' \) | wc -l | tr -d '[:space:]')"
+  if [ "$count" -eq 0 ]; then
+    return 0
+  fi
+
+  mkdir -p "$out_dir"
+  find "$COLMAP_IMAGE_DIR" -maxdepth 1 -type f \( -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.bmp' -o -iname '*.tif' -o -iname '*.tiff' \) -print0 \
+    | xargs -0 -r mv -t "$out_dir"
+  echo "Moved $count COLMAP image(s) to: $out_dir"
+}
+
+stop_screen_group() {
+  local name="$1"
+  local sid
+  while IFS= read -r sid; do
+    [ -n "$sid" ] || continue
+    screen -S "$sid" -X stuff $'\003' >/dev/null 2>&1 || true
+    sleep 1
+    screen -S "$sid" -X quit >/dev/null 2>&1 || true
+  done < <((screen -ls || true) | awk -v suffix=".$name" '$1 ~ suffix "$" {print $1}')
+}
+
+merge_segmented_pcd_results() {
+  local out_dir="$1"
+  local merged_file="$out_dir/merge.pcd"
+  local list_file="$out_dir/.pcd_segments_to_merge.txt"
+  local chunk_count
+
+  find "$out_dir" -maxdepth 1 -type f -regextype posix-extended -regex '.*/[0-9]+\.pcd' -printf '%f\n' \
+    | sort -n \
+    | awk -v dir="$out_dir" '{print dir "/" $0}' > "$list_file"
+
+  chunk_count="$(wc -l < "$list_file" | tr -d '[:space:]')"
+  if [ "$chunk_count" -eq 0 ]; then
+    echo "Skipped merging segmented PCD: no numeric chunk files found in $out_dir."
+    rm -f "$list_file"
+    return 0
+  fi
+
+  if ! command -v pcl_concatenate_points_pcd >/dev/null 2>&1; then
+    echo "WARNING: pcl_concatenate_points_pcd not found; cannot merge segmented PCD files."
+    rm -f "$list_file"
+    return 0
+  fi
+
+  rm -f "$merged_file" "$out_dir/output.pcd" "$out_dir/merged_segments.pcd"
+  if (cd "$out_dir" && xargs -r pcl_concatenate_points_pcd < "$list_file"); then
+    if [ -s "$out_dir/output.pcd" ]; then
+      mv "$out_dir/output.pcd" "$merged_file"
+      echo "Merged $chunk_count segmented PCD files into: $merged_file"
+    else
+      echo "WARNING: pcl_concatenate_points_pcd finished but output.pcd was not created."
+    fi
+  else
+    echo "WARNING: failed to merge segmented PCD files into $merged_file"
+    rm -f "$out_dir/output.pcd" "$merged_file"
+  fi
+  rm -f "$list_file"
+}
+
+
+
+archive_pcd_results() {
+  local tag="$1"
+  local out_dir="$PCD_DIR/$tag"
+  local saved=0
+  mkdir -p "$out_dir"
+
+  # Compatibility path: if old runs wrote chunks in Log/PCD root, move them into this archive.
+  while IFS= read -r -d '' pcd_file; do
+    mv -f "$pcd_file" "$out_dir/"
+    echo "Moved root segmented PCD: $out_dir/$(basename "$pcd_file")"
+    saved=1
+  done < <(find "$PCD_DIR" -maxdepth 1 -type f -regextype posix-extended -regex '.*/[0-9]+\.pcd' -print0 | sort -z)
+
+  if [ -s "$PCD_DIR/scans_pos.json" ]; then
+    mv -f "$PCD_DIR/scans_pos.json" "$out_dir/scans_pos.json"
+    echo "Moved root scan poses: $out_dir/scans_pos.json"
+    saved=1
+  fi
+
+  if [ "$saved" = "0" ]; then
+    rmdir "$out_dir" 2>/dev/null || true
+    return 1
+  fi
+
+  merge_segmented_pcd_results "$out_dir"
+  echo "PCD archive directory: $out_dir"
+  find "$out_dir" -maxdepth 1 -type f -printf '%f %k KB\n' | sort
+  return 0
+}
+
+echo "[1/9] Stop old SLAM screens and archive previous PCD/COLMAP images"
+if screen -ls | grep -q 'fast_livo_mapping'; then
+  screen -S fast_livo_mapping -X stuff $'' >/dev/null 2>&1 || true
+  sleep 6
+  screen -S fast_livo_mapping -X quit >/dev/null 2>&1 || true
+  sleep 2
+  archive_pcd_results "slam_previous_$(date +%Y%m%d_%H%M%S)" || true
+else
+  archive_pcd_results "slam_previous_$(date +%Y%m%d_%H%M%S)" || true
+fi
+archive_colmap_images "colmap_previous"
+for s in camera_driver fake_camera gemini335l_driver gemini335l_depth_colormap multimodal_image_saver multimodal_raw_recorder livox_driver2 mid360_repub mid360_imu_repub stm32_trigger_bridge livox_timeshare_writer uvc_image_stamp_relay mid360_to_car_tf colmap_image_archiver roscore; do
+  stop_screen_group "$s"
+done
+sleep 1
+
+# The old session is now closed. Publish the new pointer before sensor
+# bring-up, so stop_slam can still label/close a partially started run.
+printf '%s\n' "$RUN_ID" > "$FAST_LIVO_LOG_ROOT/current_dataset_run_id.txt"
+printf '%s\n' "$DATASET_RUN_DIR" > "$FAST_LIVO_LOG_ROOT/current_dataset_run_dir.txt"
+printf '%s\n' "$DATASET_RUN_DIR" > "$PCD_DIR/current_run_dir.txt"
+printf '%s\n' "$DATASET_RUN_DIR/global/colmap" > "$COLMAP_DIR/current_dataset_run_dir.txt"
+printf '%s\n' "$DATASET_RUN_DIR/global/colmap/rgb" > "$COLMAP_DIR/current_image_run.txt"
+
+# A detached sudo/unshare wrapper can survive a force-closed screen and keep an
+# old Livox publisher alive. Clear only the Livox launch chain before restarting it.
+run_sudo pkill -TERM -f '[l]aunch_livox_driver_private_timeshare.sh' 2>/dev/null || true
+run_sudo pkill -TERM -f '[l]ivox_ros_driver2_node.*__name:=livox_lidar_publisher2' 2>/dev/null || true
+sleep 2
+
+echo "[2/9] Preflight checks"
+command -v screen >/dev/null || { echo "ERROR: screen is not installed"; exit 1; }
+[ -d "$VERSION_WS/devel" ] || { echo "ERROR: missing $VERSION_WS/devel"; exit 1; }
+[ -f "$LIVOX_WS/devel/setup.bash" ] || { echo "ERROR: missing $LIVOX_WS/devel/setup.bash"; exit 1; }
+if [ "$START_GEMINI335L" = "1" ]; then
+  [ -f "$GEMINI_WS/devel/setup.bash" ] || {
+    echo "ERROR: Gemini workspace is missing: $GEMINI_WS/devel/setup.bash"
+    exit 1
+  }
+  bash --noprofile --norc -c \
+    "source /opt/ros/noetic/setup.bash; source '$GEMINI_WS/devel/setup.bash'; rospack find orbbec_camera >/dev/null; rospack find gemini335l_tools >/dev/null" \
+    || { echo "ERROR: ROS package orbbec_camera or gemini335l_tools is unavailable"; exit 1; }
+fi
+VERSION_CONFIG="$VERSION_SRC/FAST-LIVO2/config/uvc_mid360.yaml"
+[ -f "$VERSION_CONFIG" ] || { echo "ERROR: missing version config $VERSION_CONFIG"; exit 1; }
+[ -x "$VERSION_SRC/FAST-LIVO2/scripts/multimodal_image_saver.py" ] || {
+  echo "ERROR: missing multimodal image saver"
+  exit 1
+}
+[ -x "$VERSION_SRC/FAST-LIVO2/scripts/dataset_manifest.py" ] || {
+  echo "ERROR: missing dataset manifest tool"
+  exit 1
+}
+[ -x "$VERSION_SRC/FAST-LIVO2/scripts/multimodal_raw_recorder.py" ] || {
+  echo "ERROR: missing multimodal raw recorder"
+  exit 1
+}
+echo "Using version-local config: $VERSION_CONFIG"
+
+echo "[3/9] Prepare camera"
+run_sudo modprobe uvcvideo 2>/dev/null || true
+
+find_global_shutter_node() {
+  local wanted_index="$1"
+  local override_dev="$2"
+  local dev
+  local props
+  local index
+
+  if [ -n "$override_dev" ] && [ -e "$override_dev" ]; then
+    readlink -f "$override_dev"
+    return 0
+  fi
+
+  # Prefer the persistent by-id name of the original RGB camera. Never select
+  # an Orbbec node just because it happened to become /dev/video0.
+  for dev in /dev/v4l/by-id/usb-Global_Shutter_Camera_*-video-index"$wanted_index"; do
+    [ -e "$dev" ] || continue
+    readlink -f "$dev"
+    return 0
+  done
+
+  # Fallback for systems where by-id links are temporarily unavailable.
+  for dev in /dev/video*; do
+    [ -e "$dev" ] || continue
+    props="$(udevadm info -q property -n "$dev" 2>/dev/null || true)"
+    index="$(cat "/sys/class/video4linux/${dev##*/}/index" 2>/dev/null || true)"
+    if printf '%s\n' "$props" | grep -q '^ID_VENDOR_ID=32e4$' &&
+       printf '%s\n' "$props" | grep -q '^ID_MODEL_ID=05b1$' &&
+       [ "$index" = "$wanted_index" ]; then
+      readlink -f "$dev"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+CAMERA_REAL_DEV=""
+CAMERA_METADATA_REAL_DEV=""
+for i in $(seq 1 20); do
+  CAMERA_REAL_DEV="$(find_global_shutter_node 0 "$CAMERA_DEV" || true)"
+  CAMERA_METADATA_REAL_DEV="$(find_global_shutter_node 1 "$CAMERA_METADATA_DEV" || true)"
+  [ -n "$CAMERA_REAL_DEV" ] && [ -n "$CAMERA_METADATA_REAL_DEV" ] && break
+  sleep 0.5
+done
+if [ -z "$CAMERA_REAL_DEV" ] || [ -z "$CAMERA_METADATA_REAL_DEV" ]; then
+  echo "ERROR: original Global Shutter RGB camera image/metadata pair was not found."
+  echo "Gemini devices are deliberately excluded from FAST-LIVO RGB selection."
+  echo "Diagnostics:"
+  ls -l /dev/video* /dev/v4l/by-id/* /dev/v4l/by-path/* 2>/dev/null || true
+  exit 1
+fi
+run_sudo ln -sfn "$CAMERA_REAL_DEV" "$CAMERA_STABLE_DEV"
+run_sudo ln -sfn "$CAMERA_METADATA_REAL_DEV" "$CAMERA_METADATA_STABLE_DEV"
+run_sudo chmod a+rw "$CAMERA_REAL_DEV" 2>/dev/null || true
+run_sudo chmod a+rw "$CAMERA_METADATA_REAL_DEV" 2>/dev/null || true
+echo "FAST-LIVO RGB image:    $CAMERA_STABLE_DEV -> $CAMERA_REAL_DEV"
+echo "FAST-LIVO RGB metadata: $CAMERA_METADATA_STABLE_DEV -> $CAMERA_METADATA_REAL_DEV"
+if ! v4l2-ctl -d "$CAMERA_STABLE_DEV" --info 2>&1 | grep -q 'Global Shutter Camera'; then
+  echo "ERROR: $CAMERA_STABLE_DEV does not resolve to the original Global Shutter camera"
+  exit 1
+fi
+
+echo "[4/9] Configure MID360 network on $LIVOX_IFACE"
+if ! ip -br addr show dev "$LIVOX_IFACE" | grep -q "$LIVOX_IP/24"; then
+  run_sudo ip addr add "$LIVOX_IP/24" dev "$LIVOX_IFACE" 2>/dev/null || true
+fi
+run_sudo ip route replace 192.168.1.0/24 dev "$LIVOX_IFACE" src "$LIVOX_IP"
+
+echo "[5/9] Start roscore"
+screen -L -Logfile "$LOG_DIR/roscore.log" -dmS roscore bash --noprofile --norc -c 'source $ROS_ENV; roscore'
+for i in $(seq 1 20); do
+  if bash --noprofile --norc -c 'source $ROS_ENV; rostopic list >/dev/null 2>&1'; then break; fi
+  sleep 0.5
+  [ "$i" -eq 20 ] && { echo "ERROR: roscore did not start; see $LOG_DIR/roscore.log"; exit 1; }
+done
+
+if [ "$START_GEMINI335L" = "1" ]; then
+  echo "[5b/9] Start Gemini 335L RGB + depth + left/right IR streams as /$GEMINI_CAMERA_NAME"
+  : > "$LOG_DIR/gemini335l_driver.log"
+  screen -L -Logfile "$LOG_DIR/gemini335l_driver.log" -dmS gemini335l_driver \
+    bash --noprofile --norc -c "source /opt/ros/noetic/setup.bash; source '$GEMINI_WS/devel/setup.bash'; roslaunch orbbec_camera gemini_330_series.launch camera_name:='$GEMINI_CAMERA_NAME' enumerate_net_device:=false enable_color:=true enable_depth:=true enable_left_ir:=true enable_right_ir:=true enable_point_cloud:=false enable_colored_point_cloud:=false depth_registration:=false publish_tf:=true frame_timestamp_csv_file:='$DATASET_RUN_DIR/raw/gemini_hardware_timestamps.csv'"
+  : > "$LOG_DIR/gemini335l_depth_colormap.log"
+  screen -L -Logfile "$LOG_DIR/gemini335l_depth_colormap.log" -dmS gemini335l_depth_colormap \
+    bash --noprofile --norc -c "source /opt/ros/noetic/setup.bash; source '$GEMINI_WS/devel/setup.bash'; rosrun gemini335l_tools depth_colormap_node.py _input:='/$GEMINI_CAMERA_NAME/depth/image_raw' _output:='/$GEMINI_CAMERA_NAME/depth/image_colorized' _min_depth_mm:='$GEMINI_DEPTH_MIN_MM' _max_depth_mm:='$GEMINI_DEPTH_MAX_MM'"
+fi
+
+echo "[6/9] Start MID360 driver with an isolated internal timeshare"
+rm -f "$HOME/timeshare" "$HOME/timeshare.livox_driver_internal" "$HOME/mid360_clock_offset" "$HOME/stm32_trigger_time" /tmp/stm32_trigger_bridge.ready
+truncate -s 16 "$HOME/timeshare"
+truncate -s 16 "$HOME/timeshare.livox_driver_internal"
+run_sudo rm -f /tmp/fast_livo_livox_timeshare_namespace.ready
+# Do not leak a caller-provided sudo password into long-running sensor screens.
+unset SUDO_PASSWORD
+: > "$LOG_DIR/livox_driver.log"
+screen -L -Logfile "$LOG_DIR/livox_driver.log" -dmS livox_driver2 \
+  bash --noprofile --norc -c "sudo -n env FAST_LIVO_RUNTIME_USER='$USER' FAST_LIVO_RUNTIME_HOME='$HOME' LIVOX_WS='$LIVOX_WS' unshare --mount --propagation private '$SCRIPT_DIR/launch_livox_driver_private_timeshare.sh'"
+for i in $(seq 1 50); do
+  [ -s /tmp/fast_livo_livox_timeshare_namespace.ready ] && break
+  sleep 0.1
+done
+if [ ! -s /tmp/fast_livo_livox_timeshare_namespace.ready ]; then
+  echo "ERROR: livox_ros_driver2 private timeshare namespace did not start"
+  tail -n 80 "$LOG_DIR/livox_driver.log" || true
+  exit 1
+fi
+# Keep the outer placeholder inode in place. The actual LiDAR publisher opens
+# it with O_TRUNC, while the driver's private namespace remains bind-mounted
+# to the separate internal inode.
+sleep 1
+
+echo "[7/9] Start LiDAR/IMU/image timestamp relays"
+# Official livox_ros_driver2 initializes the MID360. On this NUC it does not
+# publish ROS1 topics reliably, so these bridges publish the same CustomMsg/Imu
+# topics while using the MID360 packet timestamp definition used by driver2.
+screen -L -Logfile "$LOG_DIR/mid360_repub.log" -dmS mid360_repub bash --noprofile --norc -c 'source $ROS_ENV; /usr/bin/python3 $VERSION_SRC/FAST-Calib/scripts/mid360_udp_livox_republisher.py --bind-ip "$LIVOX_IP" --topic /livox/lidar --publish-hz 10 --timeshare-path ~/timeshare --clock-offset-path ~/mid360_clock_offset'
+screen -L -Logfile "$LOG_DIR/mid360_imu_repub.log" -dmS mid360_imu_repub bash --noprofile --norc -c 'source $ROS_ENV; /usr/bin/python3 $VERSION_WS/src/FAST-LIVO2/scripts/mid360_udp_imu_republisher.py --bind-ip "$LIVOX_IP" --topic /livox/imu'
+if [ "$USE_STM32_SERIAL_BRIDGE" = "1" ]; then
+  screen -L -Logfile "$LOG_DIR/stm32_trigger_bridge.log" -dmS stm32_trigger_bridge \
+    bash --noprofile --norc -c '/usr/bin/python3 $VERSION_ROOT/tools/stm32_trigger_bridge.py --port "${STM32_SERIAL_PORT:-auto}" --baud "${STM32_BAUD:-9600}" --output "$HOME/stm32_trigger_time" --period-us 100000 --phase-us "${STM32_TRIGGER_PHASE_US:-0}"'
+else
+  echo "STM32 serial bridge disabled; camera uses fixed-a PTS session anchoring to MID360 time."
+  echo "Each STREAMON blocks images for 0.5 s warmup + about 10 s b_session calibration."
+fi
+sleep 5
+
+echo "[8/9] Check required topics"
+CHECK_ENV='source $ROS_ENV'
+check_messages() {
+  local topic="$1"
+  local log_name="$2"
+  local wait_sec="${3:-12}"
+  local deadline
+  local out
+  deadline=$((SECONDS + wait_sec))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if out="$(bash --noprofile --norc -c "$CHECK_ENV; timeout 4 rostopic echo -n 1 '$topic/header/stamp'" 2>&1)"; then
+      printf '%s\n' "$out"
+      return 0
+    fi
+    printf 'Waiting for %s measurable data... (%ds left)\n' "$topic" "$((deadline - SECONDS))"
+    if [ "$topic" = "/uvc_camera/image_sync" ]; then
+      grep -aE 'PTS_SESSION_ANCHOR_(START|WAIT|LOCKED|FAILED)' "$LOG_DIR/camera_driver.log" 2>/dev/null \
+        | tail -n 1 \
+        | sed -E $'s/\x1B\[[0-9;]*[[:alpha:]]//g' \
+        || true
+    fi
+    sleep 1
+  done
+  printf '%s\n' "$out"
+  echo "ERROR: $topic has no measurable data after ${wait_sec}s; see $log_name"
+  return 1
+}
+
+check_messages_once() {
+  local topic="$1"
+  local log_name="$2"
+  local out
+  if ! out="$(bash --noprofile --norc -c "$CHECK_ENV; timeout 12 rostopic echo -n 1 '$topic/header/stamp'" 2>&1)"; then
+    printf '%s\n' "$out"
+    echo "ERROR: $topic has no measurable data; see $log_name"
+    exit 1
+  fi
+  printf '%s\n' "$out"
+}
+if [ "$START_GEMINI335L" = "1" ]; then
+  check_messages "/$GEMINI_CAMERA_NAME/color/image_raw" "$LOG_DIR/gemini335l_driver.log" 35
+  check_messages "/$GEMINI_CAMERA_NAME/depth/image_raw" "$LOG_DIR/gemini335l_driver.log" 35
+  check_messages "/$GEMINI_CAMERA_NAME/left_ir/image_raw" "$LOG_DIR/gemini335l_driver.log" 35
+  check_messages "/$GEMINI_CAMERA_NAME/right_ir/image_raw" "$LOG_DIR/gemini335l_driver.log" 35
+  echo "OK: Gemini 335L RGB, raw depth, left IR and right IR streams are publishing."
+fi
+: > "$LOG_DIR/multimodal_image_saver.log"
+screen -L -Logfile "$LOG_DIR/multimodal_image_saver.log" -dmS multimodal_image_saver \
+  bash --noprofile --norc -c "source /opt/ros/noetic/setup.bash; /usr/bin/python3 '$VERSION_SRC/FAST-LIVO2/scripts/multimodal_image_saver.py' _output_root:='$DATASET_RUN_DIR/raw' _camera_name:='$GEMINI_CAMERA_NAME' _save_hz:='$GEMINI_DATASET_SAVE_HZ' _rgb_save_hz:='$RGB_DATASET_SAVE_HZ' _queue_size:='$GEMINI_DATASET_QUEUE_SIZE' _png_compression:='$GEMINI_DATASET_PNG_COMPRESSION'"
+sleep 2
+if ! rosnode list 2>/dev/null | grep -qx /multimodal_image_saver; then
+  echo "ERROR: multimodal image saver did not start; see $LOG_DIR/multimodal_image_saver.log"
+  tail -n 80 "$LOG_DIR/multimodal_image_saver.log" || true
+  exit 1
+fi
+echo "OK: RGB/depth/IR asynchronous saver is running at target $RGB_DATASET_SAVE_HZ/$GEMINI_DATASET_SAVE_HZ Hz."
+check_messages /livox/lidar "$LOG_DIR/livox_driver.log and $LOG_DIR/mid360_repub.log" "$LIDAR_WAIT_SEC"
+check_messages /livox/imu "$LOG_DIR/mid360_imu_repub.log" "$IMU_WAIT_SEC"
+if [ "$(stat -c %i "$HOME/timeshare")" = "$(stat -c %i "$HOME/timeshare.livox_driver_internal")" ]; then
+  echo "ERROR: runtime and livox-driver timeshare files still share one inode"
+  exit 1
+fi
+screen -ls | grep -q 'livox_timeshare_writer' && {
+  echo "ERROR: obsolete competing timeshare writer is still running"
+  exit 1
+}
+
+clock_ready=0
+for i in $(seq 1 40); do
+  if [ -s "$HOME/mid360_clock_offset" ]; then
+    clock_seq="$(od -An -td8 -N8 "$HOME/mid360_clock_offset" 2>/dev/null | tr -d '[:space:]')"
+    if [ -n "$clock_seq" ] && [ "$clock_seq" -gt 0 ] 2>/dev/null && [ $((clock_seq % 2)) -eq 0 ]; then
+      clock_ready=1
+      break
+    fi
+  fi
+  sleep 0.25
+done
+[ "$clock_ready" = "1" ] || {
+  echo "ERROR: MID360 clock offset is not ready; see $LOG_DIR/mid360_repub.log"
+  exit 1
+}
+
+if [ "$USE_STM32_SERIAL_BRIDGE" = "1" ]; then
+  trigger_ready=0
+  for i in $(seq 1 60); do
+    if [ -s /tmp/stm32_trigger_bridge.ready ] && [ -s "$HOME/stm32_trigger_time" ]; then
+      trigger_seq="$(od -An -td8 -N8 "$HOME/stm32_trigger_time" 2>/dev/null | tr -d '[:space:]')"
+      if [ -n "$trigger_seq" ] && [ "$trigger_seq" -gt 0 ] 2>/dev/null && [ $((trigger_seq % 2)) -eq 0 ]; then
+        trigger_ready=1
+        break
+      fi
+    fi
+    sleep 0.25
+  done
+  [ "$trigger_ready" = "1" ] || {
+    echo "ERROR: STM32 trigger bridge is not ready; see $LOG_DIR/stm32_trigger_bridge.log"
+    tail -n 80 "$LOG_DIR/stm32_trigger_bridge.log" || true
+    exit 1
+  }
+fi
+
+echo "[8b/9] Start camera after MID360 clock mapping is live"
+camera_ready=0
+for camera_attempt in 1 2; do
+  stop_screen_group camera_driver
+  stop_screen_group uvc_image_stamp_relay
+  sleep 3
+  if ! timeout 5 v4l2-ctl -d "$CAMERA_STABLE_DEV" --all >/dev/null 2>&1; then
+    echo "Camera device is not ready on attempt ${camera_attempt}/2"
+    sleep 5
+    continue
+  fi
+  : > "$LOG_DIR/camera_driver.log"
+  : > "$LOG_DIR/uvc_image_stamp_relay.log"
+  screen -L -Logfile "$LOG_DIR/camera_driver.log" -dmS camera_driver bash --noprofile --norc -c 'source $ROS_ENV; rosrun mvs_ros_driver uvc_driver $VERSION_WS/src/mvs_ros_driver/config/uvc_camera.yaml'
+  sleep 2
+  screen -L -Logfile "$LOG_DIR/uvc_image_stamp_relay.log" -dmS uvc_image_stamp_relay bash --noprofile --norc -c 'source $ROS_ENV; /usr/bin/python3 $VERSION_SRC/FAST-LIVO2/scripts/uvc_image_stamp_relay.py _min_interval:=0.0'
+  sleep 3
+  if check_messages /uvc_camera/image_sync "$LOG_DIR/camera_driver.log and $LOG_DIR/uvc_image_stamp_relay.log" "$CAMERA_WAIT_SEC"; then
+    camera_ready=1
+    break
+  fi
+  echo "Camera timestamp bootstrap failed on attempt ${camera_attempt}/2; releasing the device before retry."
+  tail -n 40 "$LOG_DIR/camera_driver.log" || true
+  sleep 5
+done
+if [ "$camera_ready" != "1" ]; then
+  stop_screen_group camera_driver
+  stop_screen_group uvc_image_stamp_relay
+  echo "ERROR: camera did not recover after two clean bootstrap attempts."
+  exit 1
+fi
+
+# Image publication is blocked inside uvc_driver until the fixed-a session
+# anchor passes all residual/anomaly gates. Require the explicit lock as a
+# second barrier before clock-domain checks and FAST-LIVO mapping.
+session_anchor_locked="$(bash --noprofile --norc -c \
+  'source "$ROS_ENV"; rosparam get /uvc_camera/session_anchor_locked 2>/dev/null' \
+  || true)"
+if [ "$session_anchor_locked" != "true" ]; then
+  echo "ERROR: Camera b_session is not locked; refusing to start FAST-LIVO mapping."
+  tail -n 100 "$LOG_DIR/camera_driver.log" || true
+  exit 1
+fi
+session_anchor_b_ns="$(bash --noprofile --norc -c \
+  'source "$ROS_ENV"; rosparam get /uvc_camera/session_anchor_b_ns 2>/dev/null' \
+  || true)"
+echo "OK: Camera PTS session anchor locked; b_session_ns=${session_anchor_b_ns}"
+
+clock_domain_ok=0
+clock_domain_stable=0
+for i in $(seq 1 60); do
+  if bash --noprofile --norc -c 'source $ROS_ENV; /usr/bin/python3 $VERSION_SRC/FAST-LIVO2/scripts/verify_sensor_clock_domain.py --max-spread 0.5'; then
+    clock_domain_stable=$((clock_domain_stable + 1))
+    echo "Clock-domain timestamps stable: ${clock_domain_stable}/3"
+    if [ "$clock_domain_stable" -ge 3 ]; then
+      clock_domain_ok=1
+      break
+    fi
+  else
+    clock_domain_stable=0
+  fi
+  echo "Waiting for LiDAR/IMU/Camera clock-domain timestamps to settle... ($i/60)"
+  sleep 1
+done
+[ "$clock_domain_ok" = "1" ] || {
+  echo "ERROR: LiDAR/IMU/Camera headers are not in one clock domain"
+  exit 1
+}
+
+echo "[8c/9] Print LiDAR/IMU/Camera timestamp alignment before FAST-LIVO"
+if /usr/bin/python3 "$VERSION_SRC/FAST-LIVO2/scripts/sensor_time_alignment_report.py" \
+    --duration "$SENSOR_TIME_ALIGNMENT_SAMPLE_SEC" \
+    --max-current-spread 0.5 \
+    --camera-config "$VERSION_WS/src/mvs_ros_driver/config/uvc_camera.yaml" \
+    2>&1 | tee "$SENSOR_TIME_ALIGNMENT_REPORT"; then
+  echo "Timestamp alignment report: $SENSOR_TIME_ALIGNMENT_REPORT"
+else
+  echo "WARNING: detailed timestamp report was incomplete; the existing 3-pass clock-domain gate already passed."
+  echo "Timestamp alignment report: $SENSOR_TIME_ALIGNMENT_REPORT"
+fi
+
+if [ "$LEGACY_COLMAP_OUTPUT" = "1" ]; then
+  start_colmap_image_archiver "$COLMAP_RGB_DIR"
+else
+  echo "Legacy COLMAP image copy disabled; raw/rgb is the authoritative RGB stream."
+fi
+
+printf '%s\n' "$RUN_ID" > "$FAST_LIVO_LOG_ROOT/current_dataset_run_id.txt"
+printf '%s\n' "$DATASET_RUN_DIR" > "$FAST_LIVO_LOG_ROOT/current_dataset_run_dir.txt"
+printf '%s\n' "$COLMAP_RUN_DIR" > "$COLMAP_DIR/current_dataset_run_dir.txt"
+printf '%s\n' "$DATASET_RUN_DIR" > "$PCD_DIR/current_run_dir.txt"
+printf '%s\n' "$COLMAP_RGB_DIR" > "$COLMAP_DIR/current_image_run.txt"
+cp -f "$VERSION_CONFIG" "$DATASET_RUN_DIR/global/config/uvc_mid360.yaml"
+cp -f "$VERSION_WS/src/mvs_ros_driver/config/uvc_camera.yaml" \
+  "$DATASET_RUN_DIR/global/config/uvc_camera.yaml" 2>/dev/null || true
+cp -f "$VERSION_SRC/FAST-LIVO2/config/camera_uvc.yaml" \
+  "$DATASET_RUN_DIR/global/config/camera_uvc.yaml" 2>/dev/null || true
+cp -f "$VERSION_SRC/FAST-LIVO2/config/gemini335l_lidar_depth_extrinsic.yaml" \
+  "$DATASET_RUN_DIR/global/config/" 2>/dev/null || true
+printf '%s\n' "$LEGACY_COLMAP_OUTPUT" > "$DATASET_RUN_DIR/global/config/legacy_colmap_output.txt"
+/usr/bin/python3 "$VERSION_SRC/FAST-LIVO2/scripts/dataset_manifest.py" start \
+  --run-id "$RUN_ID" \
+  --dataset-dir "$DATASET_RUN_DIR" \
+  --config "$VERSION_CONFIG" \
+  --camera-intrinsics "$VERSION_SRC/FAST-LIVO2/config/camera_uvc.yaml" \
+  --camera-time-config "$VERSION_WS/src/mvs_ros_driver/config/uvc_camera.yaml" \
+  --gemini-extrinsics "$VERSION_SRC/FAST-LIVO2/config/gemini335l_lidar_depth_extrinsic.yaml"
+
+: > "$LOG_DIR/multimodal_raw_recorder.log"
+screen -L -Logfile "$LOG_DIR/multimodal_raw_recorder.log" -dmS multimodal_raw_recorder \
+  bash --noprofile --norc -c "source '$ROS_ENV'; /usr/bin/python3 '$VERSION_SRC/FAST-LIVO2/scripts/multimodal_raw_recorder.py' _output_root:='$DATASET_RUN_DIR/raw' _lidar_queue_size:='$LIDAR_DATASET_QUEUE_SIZE'"
+sleep 2
+if ! rosnode list 2>/dev/null | grep -qx /multimodal_raw_recorder; then
+  echo "ERROR: raw LiDAR/IMU/pose recorder did not start; see $LOG_DIR/multimodal_raw_recorder.log"
+  tail -n 80 "$LOG_DIR/multimodal_raw_recorder.log" || true
+  exit 1
+fi
+
+MAPPING_RVIZ=0
+MULTIVIEW_RVIZ=0
+if [ "$START_RVIZ" = "1" ]; then
+  case "$RVIZ_LAYOUT" in
+    single)
+      MAPPING_RVIZ=1
+      ;;
+    multi|multiview)
+      MULTIVIEW_RVIZ=1
+      ;;
+    *)
+      echo "ERROR: RVIZ_LAYOUT must be single, multi, or multiview (got: $RVIZ_LAYOUT)"
+      exit 1
+      ;;
+  esac
+fi
+
+echo "[9/9] Start FAST-LIVO2 mapping with RViz=$START_RVIZ layout=$RVIZ_LAYOUT"
+if [ "$START_RVIZ" = "1" ]; then
+  GUI_ENV="$(systemctl --user show-environment 2>/dev/null || true)"
+  for key in DISPLAY XAUTHORITY DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR WAYLAND_DISPLAY; do
+    val="$(printf '%s\n' "$GUI_ENV" | sed -n "s/^${key}=//p" | tail -n 1)"
+    [ -n "$val" ] && export "$key=$val"
+  done
+  export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-xcb}"
+fi
+mkdir -p "$PCD_RUN_DIR/lidar" "$PCD_RUN_DIR/merge"
+screen -L -Logfile "$LOG_DIR/fast_livo_mapping.log" -dmS fast_livo_mapping bash --noprofile --norc -c "source $ROS_ENV; export DISPLAY='${DISPLAY:-}'; export XAUTHORITY='${XAUTHORITY:-}'; export DBUS_SESSION_BUS_ADDRESS='${DBUS_SESSION_BUS_ADDRESS:-}'; export XDG_RUNTIME_DIR='${XDG_RUNTIME_DIR:-}'; export QT_QPA_PLATFORM='${QT_QPA_PLATFORM:-xcb}'; roslaunch fast_livo mapping_uvc_mid360_live.launch rviz:=$MAPPING_RVIZ rviz_multiview:=$MULTIVIEW_RVIZ gemini_depth_tf:=$START_GEMINI335L pcd_output_dir:=$PCD_RUN_DIR colmap_output:=$LEGACY_COLMAP_OUTPUT innovation_csv_path:=$LOG_DIR/lio_innovation.csv"
+sleep 6
+
+if screen -ls | grep -q 'fast_livo_mapping'; then
+  echo "OK: FAST-LIVO2 screen is running. Logs are in $LOG_DIR"
+  if [ "$START_RVIZ" = "1" ]; then
+    if [ "$MULTIVIEW_RVIZ" = "1" ] &&
+       pgrep -af 'rviz.*fast_livo2_raw_map.rviz' >/dev/null &&
+       pgrep -af 'rviz.*fast_livo2_rgb_map.rviz' >/dev/null; then
+      echo "OK: uncolored-map window and RGB-map window with camera panel are running."
+    elif [ "$MAPPING_RVIZ" = "1" ] && pgrep -af 'rviz.*fast_livo2.rviz' >/dev/null; then
+      echo "OK: single RViz process is running on the NUC desktop."
+    else
+      echo "ERROR: expected visualization windows not found; see $LOG_DIR/fast_livo_mapping.log"
+      tail -n 120 "$LOG_DIR/fast_livo_mapping.log" || true
+      exit 1
+    fi
+  fi
+  echo "This run id is: $RUN_ID"
+  echo "Camera PTS/MID360 diagnostic CSV: $CAMERA_TIME_DIAG_CSV"
+  echo "RGB colorization diagnostic CSV: $RGB_COLOR_DIAG_CSV"
+  echo "Sensor timestamp alignment report: $SENSOR_TIME_ALIGNMENT_REPORT"
+  echo "FAST-LIVO2 writes PCD output under:"
+  echo "  $PCD_RUN_DIR"
+  echo "Multimodal images are stored under:"
+  echo "  $DATASET_RUN_DIR/raw"
+  echo "Use this after mapping to stop and archive PCD output with date:"
+  echo "  bash '$VERSION_ROOT/stop_slam'"
+  echo "Current dataset directory is: $DATASET_RUN_DIR"
+  # Sensor frequencies are already printed by the pre-mapping alignment
+  # report. Do not sample and print them a second time after mapping starts.
+  screen -ls
+else
+  echo "ERROR: fast_livo_mapping exited; see $LOG_DIR/fast_livo_mapping.log"
+  tail -n 120 "$LOG_DIR/fast_livo_mapping.log" || true
+  exit 1
+fi

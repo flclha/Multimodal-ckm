@@ -131,7 +131,7 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
   nh.param<double>("debug/plot_time", plot_time, -10);
   nh.param<int>("debug/frame_cnt", frame_cnt, 6);
   nh.param<string>("lio/innovation_csv_path", lio_innovation_csv_path,
-                   "/home/nuc/versions/version5/logs/lio_innovation.csv");
+                   "/tmp/fast_livo_lio_innovation.csv");
 
   nh.param<double>("publish/blind_rgb_points", blind_rgb_points, 0.01);
   nh.param<int>("publish/pub_scan_num", pub_scan_num, 1);

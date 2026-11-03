@@ -65,7 +65,7 @@ lio:
   # 输出 LiDAR 更新前预测、更新后状态以及二者的 innovation。
   innovation_diag_en: true
   innovation_warn_threshold: 0.010
-  innovation_csv_path: /home/nuc/versions/version5/logs/lio_innovation.csv
+  innovation_csv_path: /tmp/fast_livo_lio_innovation.csv
   # 实车 A/B 表明旧的地面法向速度软约束存在方向依赖，默认关闭；
   # 代码和诊断保留，便于复现实验，但不参与正式定位。
   ground_velocity_constraint_en: false

@@ -1,0 +1,363 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VERSION_ROOT="$SCRIPT_DIR"
+VERSION_WS="$VERSION_ROOT/catkin_ws"
+VERSION_SRC="$VERSION_WS/src"
+FAST_LIVO_LOG_ROOT="$VERSION_SRC/FAST-LIVO2/Log"
+PCD_DIR="$FAST_LIVO_LOG_ROOT/PCD"
+LOG_ROOT="$VERSION_ROOT/logs"
+TAG="slam_$(date +%Y%m%d_%H%M%S)"
+mkdir -p "$PCD_DIR" "$LOG_ROOT"
+
+CURRENT_RUN_DIR="$(cat "$FAST_LIVO_LOG_ROOT/current_dataset_run_dir.txt" 2>/dev/null || true)"
+if [ -z "$CURRENT_RUN_DIR" ]; then
+  CURRENT_RUN_DIR="$(cat "$PCD_DIR/current_run_dir.txt" 2>/dev/null || true)"
+fi
+RUN_ID="$(cat "$FAST_LIVO_LOG_ROOT/current_dataset_run_id.txt" 2>/dev/null || true)"
+if [ -z "$RUN_ID" ] && [ -n "$CURRENT_RUN_DIR" ]; then
+  RUN_ID="$(basename "$CURRENT_RUN_DIR")"
+fi
+if ! [[ "$RUN_ID" =~ ^[0-9]{8}_[0-9]{6}$ ]]; then
+  RUN_ID="$(date +%Y%m%d_%H%M%S)"
+  echo "WARNING: no valid active run id; using recovery log session $RUN_ID"
+fi
+LOG_DIR="$LOG_ROOT/$RUN_ID"
+mkdir -p "$LOG_DIR"
+ANCHOR_CAPTURED_AT="$(date '+%Y-%m-%d %H:%M:%S %z')"
+
+read_rosparam() {
+  local param="$1"
+  bash --noprofile --norc -c "source '$VERSION_ROOT/ros_env.sh'; rosparam get '$param'" \
+    2>/dev/null || printf 'N/A'
+}
+
+# Capture the current session result while roscore and the camera driver are
+# still alive. Printing and saving are deliberately deferred until PCD output
+# has been flushed and merged.
+ANCHOR_LOCKED="$(read_rosparam /uvc_camera/session_anchor_locked)"
+ANCHOR_B_NS="$(read_rosparam /uvc_camera/session_anchor_b_ns)"
+ANCHOR_ELAPSED_MS="$(read_rosparam /uvc_camera/session_anchor_elapsed_ms)"
+ANCHOR_VALID_PAIRS="$(read_rosparam /uvc_camera/session_anchor_valid_pairs)"
+ANCHOR_MEAN_MS="$(read_rosparam /uvc_camera/session_anchor_residual_mean_ms)"
+ANCHOR_P95_MS="$(read_rosparam /uvc_camera/session_anchor_residual_p95_ms)"
+ANCHOR_DRIFT_MS_PER_S="$(read_rosparam /uvc_camera/session_anchor_residual_drift_ms_per_s)"
+
+anchor_result="INCOMPLETE"
+if [ "$ANCHOR_LOCKED" = "true" ]; then
+  if awk -v mean="$ANCHOR_MEAN_MS" -v p95="$ANCHOR_P95_MS" \
+      -v drift="$ANCHOR_DRIFT_MS_PER_S" 'BEGIN {
+        if (mean == "N/A" || p95 == "N/A" || drift == "N/A") exit 1;
+        if (mean < 0) mean = -mean;
+        if (drift < 0) drift = -drift;
+        exit ! (mean < 1.0 && p95 < 3.0 && drift < 0.05);
+      }'; then
+    anchor_result="PASS"
+  else
+    anchor_result="WARN"
+  fi
+fi
+
+print_and_save_anchor_result() {
+  local result_file="$LOG_DIR/time_alignment_summary.txt"
+  mkdir -p "$LOG_DIR"
+  {
+    printf '\n'
+    printf '%s\n' '================ CAMERA-LIDAR SESSION ANCHOR RESULT ================'
+    printf '[anchor] captured_before_shutdown: %s\n' "$ANCHOR_CAPTURED_AT"
+    printf '[anchor] model: t_camera = fixed_a * (PTS / 48 MHz) + b_session\n'
+    printf '[anchor] locked: %s\n' "$ANCHOR_LOCKED"
+    printf '[anchor] b_session_ns: %s\n' "$ANCHOR_B_NS"
+    printf '[anchor] elapsed_ms: %s\n' "$ANCHOR_ELAPSED_MS"
+    printf '[anchor] valid_pairs: %s\n' "$ANCHOR_VALID_PAIRS"
+    printf '[anchor] residual_mean_ms: %s  (limit: abs < 1.0 ms)\n' "$ANCHOR_MEAN_MS"
+    printf '[anchor] residual_p95_ms: %s  (limit: < 3.0 ms)\n' "$ANCHOR_P95_MS"
+    printf '[anchor] residual_drift_ms_per_s: %s  (limit: abs < 0.05 ms/s)\n' "$ANCHOR_DRIFT_MS_PER_S"
+    printf '[anchor] RESULT=%s\n' "$anchor_result"
+    printf '[anchor] saved: %s\n' "$result_file"
+    printf '%s\n' '===================================================================='
+  } | tee "$result_file"
+  if [ -n "$CURRENT_RUN_DIR" ] && [ -d "$CURRENT_RUN_DIR/global/config" ]; then
+    cp -f "$result_file" "$CURRENT_RUN_DIR/global/config/time_alignment_summary.txt"
+  fi
+}
+
+COLMAP_DIR="$VERSION_SRC/FAST-LIVO2/Log/Colmap"
+COLMAP_IMAGE_DIR="$COLMAP_DIR/images"
+COLMAP_RUN_DIR="$(cat "$COLMAP_DIR/current_dataset_run_dir.txt" 2>/dev/null || true)"
+if [ -z "$COLMAP_RUN_DIR" ] && [ -n "$RUN_ID" ]; then
+  COLMAP_RUN_DIR="$COLMAP_DIR/$RUN_ID"
+fi
+
+flush_colmap_images_to_current_run() {
+  # Move any remaining loose images into the current timestamp folder before stopping.
+  local run_dir
+  local archived_count
+  local indexed_count
+  if [ "$(cat "$CURRENT_RUN_DIR/global/config/legacy_colmap_output.txt" 2>/dev/null || printf '0')" != "1" ]; then
+    echo "Legacy COLMAP output was disabled for this run; raw/rgb already contains RGB frames."
+    return 0
+  fi
+  run_dir="$(cat "$COLMAP_DIR/current_image_run.txt" 2>/dev/null || true)"
+  if [ -z "$run_dir" ]; then
+    return 0
+  fi
+  mkdir -p "$run_dir"
+  find "$COLMAP_IMAGE_DIR" -maxdepth 1 -type f \( -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.bmp' -o -iname '*.tif' -o -iname '*.tiff' \) -print0 \
+    | xargs -0 -r mv -n -t "$run_dir"
+  echo "Flushed remaining COLMAP images to: $run_dir"
+  archived_count="$(find "$run_dir" -maxdepth 1 -type f -iname '*.png' | wc -l)"
+  indexed_count="$(awk '!/^#/ && NF == 10 {count++} END {print count+0}' "$COLMAP_DIR/sparse/0/images.txt" 2>/dev/null || printf '0')"
+  echo "COLMAP image save result: archived=$archived_count indexed=$indexed_count"
+  if [ "$archived_count" != "$indexed_count" ]; then
+    echo "WARNING: archived image count differs from images.txt pose count."
+  fi
+}
+
+archive_colmap_sparse_to_current_run() {
+  if [ -z "$COLMAP_RUN_DIR" ]; then
+    return 0
+  fi
+  if [ "$(cat "$CURRENT_RUN_DIR/global/config/legacy_colmap_output.txt" 2>/dev/null || printf '0')" != "1" ]; then
+    echo "Legacy COLMAP output was disabled for this run; skip sparse-model archive."
+    return 0
+  fi
+  mkdir -p "$COLMAP_RUN_DIR"
+  if [ -d "$COLMAP_DIR/sparse" ]; then
+    rm -rf "$COLMAP_RUN_DIR/sparse"
+    cp -a "$COLMAP_DIR/sparse" "$COLMAP_RUN_DIR/sparse"
+    echo "Archived COLMAP camera poses/model to: $COLMAP_RUN_DIR/sparse"
+  fi
+}
+
+archive_lio_diagnostics_to_current_run() {
+  local result_dir="$CURRENT_RUN_DIR/global/config"
+  local innovation_csv="$LOG_DIR/lio_innovation.csv"
+  if [ -z "$result_dir" ] || [ ! -d "$result_dir" ]; then
+    result_dir="$LOG_DIR"
+    mkdir -p "$result_dir"
+  fi
+  if [ -s "$innovation_csv" ]; then
+    cp -f "$innovation_csv" "$result_dir/lio_innovation.csv"
+    echo "Archived LIO prediction/update diagnostic: $result_dir/lio_innovation.csv"
+  else
+    echo "WARNING: no LIO prediction/update diagnostic CSV found at $innovation_csv"
+  fi
+}
+
+stop_screen_group() {
+  local name="$1"
+  local sid
+  while IFS= read -r sid; do
+    [ -n "$sid" ] || continue
+    screen -S "$sid" -X stuff $'\003' >/dev/null 2>&1 || true
+    sleep 1
+    screen -S "$sid" -X quit >/dev/null 2>&1 || true
+  done < <((screen -ls || true) | awk -v suffix=".$name" '$1 ~ suffix "$" {print $1}')
+}
+
+stop_screen_group_graceful() {
+  local name="$1"
+  local timeout_sec="${2:-30}"
+  local sid
+  while IFS= read -r sid; do
+    [ -n "$sid" ] || continue
+    screen -S "$sid" -X stuff $'\003' >/dev/null 2>&1 || true
+    for _ in $(seq 1 "$timeout_sec"); do
+      if ! (screen -ls || true) | awk '{print $1}' | grep -qx "$sid"; then
+        sid=""
+        break
+      fi
+      sleep 1
+    done
+    if [ -n "$sid" ]; then
+      echo "WARNING: $name did not exit within ${timeout_sec}s; forcing screen shutdown."
+      screen -S "$sid" -X quit >/dev/null 2>&1 || true
+    fi
+  done < <((screen -ls || true) | awk -v suffix=".$name" '$1 ~ suffix "$" {print $1}')
+}
+
+
+
+merge_segmented_pcd_results() {
+  local out_dir="$1"
+  local output_name="${2:-merge.pcd}"
+  local merged_file="$out_dir/$output_name"
+  local list_file="$out_dir/.pcd_segments_to_merge.txt"
+  local chunk_count
+  local invalid_count=0
+
+  : > "$list_file"
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    if head -c 1024 "$out_dir/$name" 2>/dev/null | grep -aq '^# .PCD' &&
+       head -c 2048 "$out_dir/$name" 2>/dev/null | grep -aq 'DATA '; then
+      printf '%s/%s\n' "$out_dir" "$name" >> "$list_file"
+    else
+      echo "WARNING: skip incomplete/corrupt PCD chunk: $out_dir/$name"
+      invalid_count=$((invalid_count + 1))
+    fi
+  done < <(find "$out_dir" -maxdepth 1 -type f -regextype posix-extended -regex '.*/[0-9]+\.pcd' -printf '%f\n' | sort -n)
+
+  chunk_count="$(wc -l < "$list_file" | tr -d '[:space:]')"
+  if [ "$chunk_count" -eq 0 ]; then
+    echo "Skipped merging segmented PCD: no valid numeric chunk files found in $out_dir (invalid=$invalid_count)."
+    rm -f "$list_file"
+    return 0
+  fi
+
+  if [ "$chunk_count" -eq 1 ]; then
+    cp -f "$(head -n 1 "$list_file")" "$merged_file"
+    echo "Copied the single valid PCD chunk into: $merged_file"
+    rm -f "$list_file"
+    return 0
+  fi
+
+  if ! command -v pcl_concatenate_points_pcd >/dev/null 2>&1; then
+    echo "WARNING: pcl_concatenate_points_pcd not found; cannot merge segmented PCD files."
+    rm -f "$list_file"
+    return 0
+  fi
+
+  rm -f "$merged_file" "$out_dir/output.pcd" "$out_dir/merged_segments.pcd"
+  if (cd "$out_dir" && xargs -r pcl_concatenate_points_pcd < "$list_file"); then
+    if [ -s "$out_dir/output.pcd" ]; then
+      mv "$out_dir/output.pcd" "$merged_file"
+      echo "Merged $chunk_count segmented PCD files into: $merged_file"
+    else
+      echo "WARNING: pcl_concatenate_points_pcd finished but output.pcd was not created."
+    fi
+  else
+    echo "WARNING: failed to merge segmented PCD files into $merged_file"
+    rm -f "$out_dir/output.pcd" "$merged_file"
+  fi
+  rm -f "$list_file"
+}
+
+
+
+archive_pcd_results() {
+  local tag="$1"
+  local out_dir="$PCD_DIR/$tag"
+  local saved=0
+  mkdir -p "$out_dir"
+
+  # Compatibility path: if old runs wrote chunks in Log/PCD root, move them into this archive.
+  while IFS= read -r -d '' pcd_file; do
+    mv -f "$pcd_file" "$out_dir/"
+    echo "Moved root segmented PCD: $out_dir/$(basename "$pcd_file")"
+    saved=1
+  done < <(find "$PCD_DIR" -maxdepth 1 -type f -regextype posix-extended -regex '.*/[0-9]+\.pcd' -print0 | sort -z)
+
+  if [ -s "$PCD_DIR/scans_pos.json" ]; then
+    mv -f "$PCD_DIR/scans_pos.json" "$out_dir/scans_pos.json"
+    echo "Moved root scan poses: $out_dir/scans_pos.json"
+    saved=1
+  fi
+
+  if [ "$saved" = "0" ]; then
+    rmdir "$out_dir" 2>/dev/null || true
+    return 1
+  fi
+
+  merge_segmented_pcd_results "$out_dir" "merge.pcd"
+  echo "PCD archive directory: $out_dir"
+  find "$out_dir" -maxdepth 1 -type f -printf '%f %k KB\n' | sort
+  return 0
+}
+
+
+merge_existing_run_dirs() {
+  # Prefer the exact run directory recorded by start_slam1.
+  # This prevents stop_slam from accidentally merging an older non-empty slam_* directory.
+  local current
+  current="$CURRENT_RUN_DIR"
+  if [ -n "$current" ] && [ -d "$current" ]; then
+    local chunk_root="$current/global/pcd_chunks"
+    if find "$chunk_root/merge" "$chunk_root/lidar" -maxdepth 1 -type f -regextype posix-extended -regex '.*/[0-9]+\.pcd' 2>/dev/null | grep -q .; then
+      merge_segmented_pcd_results "$chunk_root/merge" "merge.pcd"
+      merge_segmented_pcd_results "$chunk_root/lidar" "lidar.pcd"
+      [ -s "$chunk_root/merge/merge.pcd" ] && cp -f "$chunk_root/merge/merge.pcd" "$current/global/global_map.pcd"
+      [ -s "$chunk_root/lidar/lidar.pcd" ] && cp -f "$chunk_root/lidar/lidar.pcd" "$current/global/lidar_map.pcd"
+      echo "Dataset PCD directory: $chunk_root"
+      find "$chunk_root/merge" "$chunk_root/lidar" -maxdepth 1 -type f -printf '%p %k KB\n' | sort
+      return 0
+    fi
+    echo "Current run directory has no segmented PCD yet: $chunk_root/merge and $chunk_root/lidar"
+  fi
+  return 1
+}
+
+echo "Stopping FAST-LIVO2 and copying PCD output to $TAG ..."
+if screen -ls | grep -q 'fast_livo_mapping'; then
+  screen -S fast_livo_mapping -X stuff $'\003' >/dev/null 2>&1 || true
+  # Let the bounded asynchronous COLMAP queue and PCD writer drain cleanly.
+  # Exit as soon as the mapping process finishes; force-close only on timeout.
+  for _ in $(seq 1 30); do
+    if ! screen -ls | grep -q 'fast_livo_mapping'; then
+      break
+    fi
+    sleep 1
+  done
+  if screen -ls | grep -q 'fast_livo_mapping'; then
+    echo "WARNING: mapping did not exit within 30 s; forcing screen shutdown."
+    screen -S fast_livo_mapping -X quit >/dev/null 2>&1 || true
+  fi
+else
+  echo "fast_livo_mapping screen is not running; archiving existing PCD files if present."
+fi
+
+archive_lio_diagnostics_to_current_run
+stop_screen_group_graceful multimodal_raw_recorder 120
+stop_screen_group_graceful multimodal_image_saver 30
+flush_colmap_images_to_current_run
+archive_colmap_sparse_to_current_run
+for s in camera_driver fake_camera gemini335l_driver gemini335l_depth_colormap livox_driver2 mid360_repub mid360_imu_repub livox_timeshare_writer uvc_image_stamp_relay mid360_to_car_tf colmap_image_archiver roscore; do
+  stop_screen_group "$s"
+done
+sleep 2
+
+if ! merge_existing_run_dirs; then
+  if [[ "$CURRENT_RUN_DIR" == *"/Multimodal_Dataset/"* ]]; then
+    echo "WARNING: this dataset session has no valid global-map PCD; it will be finalized as incomplete."
+  elif ! archive_pcd_results "$TAG"; then
+    echo "No PCD output found to archive."
+    print_and_save_anchor_result
+    exit 1
+  fi
+fi
+
+print_and_save_anchor_result
+
+if [ -n "$CURRENT_RUN_DIR" ] && [ -d "$CURRENT_RUN_DIR" ]; then
+  mkdir -p "$CURRENT_RUN_DIR/global/config"
+  cp -f "$VERSION_SRC/FAST-LIVO2/config/uvc_mid360.yaml" "$CURRENT_RUN_DIR/global/config/uvc_mid360.yaml" 2>/dev/null || true
+  cp -f "$VERSION_WS/src/mvs_ros_driver/config/uvc_camera.yaml" "$CURRENT_RUN_DIR/global/config/uvc_camera.yaml" 2>/dev/null || true
+  cp -f "$VERSION_SRC/FAST-LIVO2/config/camera_uvc.yaml" "$CURRENT_RUN_DIR/global/config/camera_uvc.yaml" 2>/dev/null || true
+  cp -f "$VERSION_SRC/FAST-LIVO2/config/gemini335l_lidar_depth_extrinsic.yaml" "$CURRENT_RUN_DIR/global/config/" 2>/dev/null || true
+  cp -f "$LOG_DIR/multimodal_image_saver.log" "$CURRENT_RUN_DIR/global/config/" 2>/dev/null || true
+  cp -f "$LOG_DIR/multimodal_raw_recorder.log" "$CURRENT_RUN_DIR/global/config/" 2>/dev/null || true
+  cp -f "$LOG_DIR/sensor_time_alignment.txt" "$CURRENT_RUN_DIR/global/config/" 2>/dev/null || true
+  cp -f "$LOG_DIR/pts_mid360.csv" "$CURRENT_RUN_DIR/global/config/main_rgb_pts_mid360.csv" 2>/dev/null || true
+  cp -f "$LOG_DIR/rgb_colorization.csv" "$CURRENT_RUN_DIR/global/config/" 2>/dev/null || true
+  /usr/bin/python3 "$VERSION_SRC/FAST-LIVO2/scripts/dataset_manifest.py" finalize \
+    --run-id "$RUN_ID" \
+    --dataset-dir "$CURRENT_RUN_DIR" \
+    --config "$VERSION_SRC/FAST-LIVO2/config/uvc_mid360.yaml" \
+    --camera-intrinsics "$VERSION_SRC/FAST-LIVO2/config/camera_uvc.yaml" \
+    --camera-time-config "$VERSION_WS/src/mvs_ros_driver/config/uvc_camera.yaml" \
+    --gemini-extrinsics "$VERSION_SRC/FAST-LIVO2/config/gemini335l_lidar_depth_extrinsic.yaml"
+  echo "Dataset manifest: $CURRENT_RUN_DIR/global/manifest.csv"
+  echo "Dataset metadata: $CURRENT_RUN_DIR/global/dataset_metadata.yaml"
+  echo "Dataset README: $CURRENT_RUN_DIR/README.md"
+  rm -f "$CURRENT_RUN_DIR/.recording" "$CURRENT_RUN_DIR/COMPLETED.txt"
+  if [ -s "$CURRENT_RUN_DIR/global/global_map.pcd" ]; then
+    rm -f "$CURRENT_RUN_DIR/ABORTED_NO_GLOBAL_MAP.txt"
+    printf 'run_id=%s\ncompleted_at=%s\n' "$RUN_ID" "$(date --iso-8601=seconds)" \
+      > "$CURRENT_RUN_DIR/COMPLETED.txt"
+  else
+    printf 'run_id=%s\nstopped_at=%s\nreason=no_valid_global_map\n' \
+      "$RUN_ID" "$(date --iso-8601=seconds)" > "$CURRENT_RUN_DIR/ABORTED_NO_GLOBAL_MAP.txt"
+  fi
+fi

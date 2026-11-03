@@ -22,7 +22,7 @@
   <arg name="prediction_ground_displacement_max_abs" default="0.060" />
   <arg name="prediction_ground_displacement_max_correction" default="0.015" />
   <arg name="prediction_ground_displacement_correction_gain" default="0.50" />
-  <arg name="innovation_csv_path" default="/home/nuc/versions/version5/logs/lio_innovation_offline.csv" />
+  <arg name="innovation_csv_path" default="/tmp/fast_livo_lio_innovation_offline.csv" />
 
   <rosparam command="load" file="$(find fast_livo)/config/uvc_mid360.yaml" />
   <param name="lio/ground_velocity_constraint_en" type="bool" value="$(arg ground_velocity_constraint_en)" />

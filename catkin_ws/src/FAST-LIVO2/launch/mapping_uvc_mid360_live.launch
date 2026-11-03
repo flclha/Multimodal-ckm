@@ -3,7 +3,7 @@
   <arg name="rviz" default="true" />
   <arg name="rviz_multiview" default="false" />
   <arg name="pcd_output_dir" default="$(find fast_livo)/Log/PCD" />
-  <arg name="innovation_csv_path" default="/home/nuc/versions/version5/logs/manual/lio_innovation.csv" />
+  <arg name="innovation_csv_path" default="/tmp/fast_livo_lio_innovation.csv" />
   <arg name="colmap_output" default="true" />
   <arg name="car_tf" default="true" />
   <arg name="gemini_depth_tf" default="true" />
