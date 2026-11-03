@@ -1,0 +1,22 @@
+# ROS/catkin generated outputs
+catkin_ws/build/
+catkin_ws/devel/
+catkin_ws/log/
+catkin_ws/logs/
+catkin_ws/src/**/Log/
+catkin_ws/src/**/logs/
+
+# Sensor recordings and generated maps
+*.bag
+*.pcd
+
+# Runtime logs and Python caches
+*.log
+**/__pycache__/
+*.py[cod]
+
+# Editor and OS metadata
+.vscode/
+.idea/
+.DS_Store
+*~

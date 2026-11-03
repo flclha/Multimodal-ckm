@@ -1,0 +1,15 @@
+build/
+devel/
+install/
+
+# Local backups and generated cache files
+*.bak
+*.bak_*
+__pycache__/
+*.py[cod]
+
+# Captured data/results should stay out of source control
+*.bag
+*.pcd
+*.ply
+*.las

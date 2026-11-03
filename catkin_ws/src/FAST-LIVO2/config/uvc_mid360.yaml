@@ -1,0 +1,144 @@
+# 参考avia中的配置
+common:
+  img_topic: "/uvc_camera/image_sync"
+  lid_topic: "/livox/lidar"
+  imu_topic: "/livox/imu"
+  img_en: 1
+  lidar_en: 1
+  ros_driver_bug_fix: false
+
+extrin_calib:
+  extrinsic_T: [-0.011, -0.02329, 0.04412]
+  extrinsic_R: [1, 0, 0, 0, 1, 0, 0, 0, 1]
+  Rcl: [ -0.012018, -0.999927, -0.000851,
+          0.367624, -0.003626, -0.929967,
+          0.929897, -0.011489,  0.367641]
+  Pcl: [ 0.024808, -0.106047, -0.046701]  # FAST-Calib joint_attempt04 2026-08-25, reprojection RMSE 1.432 px
+
+time_offset:
+  imu_time_offset: 0.0
+  img_time_offset: 0.0
+  exposure_time_init: 0.0  # Keep zero until the V4L2 timestamp-to-exposure delay is measured
+
+preprocess:
+  point_filter_num: 1
+  # 参与位资估计的点云分辨率，值越大保留点越少，计算负担越小， 2表示保留50%点
+  filter_size_surf: 0.05 # 建图精细程度
+  lidar_type: 1 # Livox MID360 (使用AVIA类型)
+  scan_line: 4 # 扫描线数
+  blind: 1.0 # 盲区距离，忽略掉传感器中心小于此直的点
+
+vio:
+  max_iterations: 5
+  outlier_threshold: 1000
+  img_point_cov: 100
+  patch_size: 8
+  patch_pyrimid_level: 4
+  normal_en: true
+  raycast_en: false
+  inverse_composition_en: false
+  exposure_estimate_en: true
+  inv_expo_cov: 0.1
+
+imu:
+  imu_en: true
+  imu_int_frame: 30
+  acc_cov: 0.5  # restored Version5 original value after motion A/B comparison
+  gyr_cov: 0.3  # restored Version5 original value
+  b_acc_cov: 0.0001
+  b_gyr_cov: 0.0001
+
+lio:
+  max_iterations: 4
+  dept_err: 0.02
+  beam_err: 0.05
+  min_eigen_value: 0.0015
+  # LIO实时匹配地图的内部体素边长；保持0.5 m以兼顾平面拟合稳定性与实时性。
+  voxel_size: 0.5
+  max_layer: 2
+  max_points_num: 50
+  layer_init_num: [5, 5, 5, 5, 5]
+  # 仅降低归一化残差尾部的测量信息，不过滤最终位姿，也不丢弃整帧。
+  robust_weight_en: true
+  robust_huber_delta: 1.5
+  robust_min_weight: 0.15
+  # 输出 LiDAR 更新前预测、更新后状态以及二者的 innovation。
+  innovation_diag_en: true
+  innovation_warn_threshold: 0.010
+  innovation_csv_path: /home/nuc/versions/version5/logs/lio_innovation.csv
+  # 实车 A/B 表明旧的地面法向速度软约束存在方向依赖，默认关闭；
+  # 代码和诊断保留，便于复现实验，但不参与正式定位。
+  ground_velocity_constraint_en: false
+  ground_velocity_constraint_post_vio_en: false
+  # VIO 法向速度增量门控为实验功能。正式实时配置保持关闭；诊断也默认关闭，
+  # 避免在普通建图时额外遍历地面匹配点。离线 A/B 通过 launch 参数单独开启。
+  vio_velocity_delta_diag_en: false
+  vio_velocity_delta_guard_en: false
+  vio_velocity_delta_guard_trigger: 0.040
+  vio_velocity_delta_guard_limit: 0.040
+  vio_velocity_delta_guard_min_stable_frames: 3
+  # 下一帧 IMU prediction 起点速度增量门控。仅相对上一帧 LiDAR 更新速度裁剪
+  # 地面法向离群增量，不强制 vz=0。2026-10-19 按用户要求启用 0.10/0.06，
+  # 并保留独立 OFF/ON 离线 A/B 结果；其余旧约束继续关闭。
+  prediction_start_velocity_delta_diag_en: false
+  prediction_start_velocity_delta_guard_en: true
+  prediction_start_velocity_delta_guard_trigger: 0.100
+  prediction_start_velocity_delta_guard_limit: 0.060
+  prediction_start_velocity_delta_guard_min_stable_frames: 3
+  ground_velocity_sigma: 0.06
+  # 实验性 VIO 后约束仅在速度变化达到 20 mm/s 时触发；当前开关关闭。
+  # 保留较高阈值可避免重复计算同一个伪测量并过度收缩协方差。
+  ground_velocity_post_vio_min_velocity_change: 0.020
+  ground_velocity_min_features: 100
+  ground_velocity_max_normal_tilt_deg: 20.0
+  ground_velocity_min_below_sensor: 0.10
+  ground_velocity_max_below_sensor: 2.50
+  ground_velocity_max_residual: 0.08
+  ground_velocity_min_normal_confidence: 0.90
+  ground_velocity_max_normal_change_deg: 8.0
+  ground_velocity_max_abs_normal_velocity: 0.50
+  ground_velocity_max_correction: 0.05
+  # 实验性 prediction 阶段局部地面法向位移约束。它不强制世界坐标 z/vz=0；
+  # 先保持关闭，通过同一 rosbag 的 OFF/ON A/B 后再决定是否用于实车。
+  prediction_ground_displacement_constraint_en: false
+  prediction_ground_displacement_sigma: 0.010
+  prediction_ground_displacement_trigger: 0.010
+  prediction_ground_displacement_max_abs: 0.060
+  prediction_ground_displacement_max_correction: 0.015
+  prediction_ground_displacement_correction_gain: 0.50
+  prediction_ground_min_stable_frames: 3
+  prediction_ground_max_reference_age_frames: 0
+
+local_map:
+  map_sliding_en: false
+  half_map_size: 100 # 影响计算负载，当前实时参与匹配的地图
+  sliding_thresh: 8
+
+uav:
+  imu_rate_odom: false
+  gravity_align_en: true
+
+publish:
+  dense_map_en: true
+  pub_effect_point_en: false
+  pub_plane_en: false
+  pub_scan_num: 1
+  blind_rgb_points: 0.0
+
+evo:
+  seq_name: "UVC_MID360"
+  pose_output_en: false
+
+pcd_save:
+  pcd_save_en: true
+  # Export undistorted camera frames without blocking the SLAM thread. A
+  # bounded queue prevents disk/PNG stalls from creating realtime backlog.
+  colmap_output_en: true
+  colmap_async_queue_size: 16
+  colmap_png_compression: 1
+  colmap_save_stride: 1 # 10秒一张图像，sx=10/stride 2=10/5s perframe
+  # PCD输出体素预设为10 mm（1 cm），便于后处理再统一降采样到约0.2 m。
+  # 当前 interval=200 为分段原始点云保存，源码不会对分段文件应用此滤波；
+  # 该值仅在 interval<0 的单文件保存模式生效，不改变实时定位前端分辨率。
+  filter_size_pcd: 0.01
+  interval: 200

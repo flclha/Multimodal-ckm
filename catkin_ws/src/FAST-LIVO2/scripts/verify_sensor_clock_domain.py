@@ -1,0 +1,47 @@
+#!/usr/bin/env python3
+"""Fail startup when LiDAR, IMU and Camera headers use different clocks."""
+
+import argparse
+import sys
+
+import rospy
+from livox_ros_driver2.msg import CustomMsg
+from sensor_msgs.msg import Image, Imu
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--max-spread', type=float, default=0.5)
+    parser.add_argument('--timeout', type=float, default=6.0)
+    args = parser.parse_args()
+
+    rospy.init_node('verify_sensor_clock_domain', anonymous=True,
+                    disable_signals=True)
+    lidar = rospy.wait_for_message('/livox/lidar', CustomMsg,
+                                   timeout=args.timeout)
+    imu = rospy.wait_for_message('/livox/imu', Imu, timeout=args.timeout)
+    camera = rospy.wait_for_message('/uvc_camera/image_sync', Image,
+                                    timeout=args.timeout)
+    stamps = {
+        'lidar': lidar.header.stamp.to_sec(),
+        'imu': imu.header.stamp.to_sec(),
+        'camera': camera.header.stamp.to_sec(),
+    }
+    spread = max(stamps.values()) - min(stamps.values())
+    rospy.loginfo(
+        'Sensor clock-domain check: lidar=%.9f imu=%.9f camera=%.9f spread=%.3f ms',
+        stamps['lidar'], stamps['imu'], stamps['camera'], spread * 1000.0)
+    if spread > args.max_spread:
+        rospy.logwarn(
+            'Sensor header timestamps have not settled yet: spread %.6f s > %.6f s',
+            spread, args.max_spread)
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except (rospy.ROSException, rospy.ROSInterruptException) as exc:
+        rospy.logerr('Sensor clock-domain check failed: %s', exc)
+        sys.exit(2)

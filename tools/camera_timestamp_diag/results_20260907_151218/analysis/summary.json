@@ -1,0 +1,93 @@
+{
+  "statistics": {
+    "v4l2_buf_timestamp": {
+      "samples": 1437,
+      "mean_ms": 99.74393110647182,
+      "std_ms": 11.70625195725319,
+      "min_ms": 95.715,
+      "max_ms": 540.209,
+      "p50_ms": 99.989,
+      "p95_ms": 100.18,
+      "frequency_hz": 10.02567262896976,
+      "below_97ms": 202,
+      "above_103ms": 1,
+      "duplicates": 0,
+      "rollbacks": 0
+    },
+    "pts_48mhz": {
+      "samples": 1257,
+      "mean_ms": 99.43616666666667,
+      "std_ms": 0.0,
+      "min_ms": 99.43616666666667,
+      "max_ms": 99.43616666666667,
+      "p50_ms": 99.43616666666667,
+      "p95_ms": 99.43616666666667,
+      "frequency_hz": 10.0567030439964,
+      "below_97ms": 0,
+      "above_103ms": 0,
+      "duplicates": 0,
+      "rollbacks": 0
+    },
+    "scr_stc_48mhz": {
+      "samples": 1257,
+      "mean_ms": 99.41567223548131,
+      "std_ms": 0.7306063165924931,
+      "min_ms": 73.62497916666666,
+      "max_ms": 99.625,
+      "p50_ms": 99.37504166666666,
+      "p95_ms": 99.50002083333334,
+      "frequency_hz": 10.058776222237338,
+      "below_97ms": 1,
+      "above_103ms": 0,
+      "duplicates": 0,
+      "rollbacks": 0
+    },
+    "host_dequeue_monotonic": {
+      "samples": 1437,
+      "mean_ms": 99.43763966457898,
+      "std_ms": 1.3909375248742286,
+      "min_ms": 95.666854,
+      "max_ms": 100.400935,
+      "p50_ms": 99.983143,
+      "p95_ms": 100.198799,
+      "frequency_hz": 10.056554071206634,
+      "below_97ms": 202,
+      "above_103ms": 0,
+      "duplicates": 0,
+      "rollbacks": 0
+    },
+    "final_image_header": {
+      "samples": 1437,
+      "mean_ms": 99.74393110647182,
+      "std_ms": 11.70625195725319,
+      "min_ms": 95.715,
+      "max_ms": 540.209,
+      "p50_ms": 99.989,
+      "p95_ms": 100.18,
+      "frequency_hz": 10.02567262896976,
+      "below_97ms": 202,
+      "above_103ms": 1,
+      "duplicates": 0,
+      "rollbacks": 0
+    }
+  },
+  "diagnostics": {
+    "video_frames": 1438,
+    "metadata_buffers": 1258,
+    "video_sequence_jumps": 0,
+    "metadata_sequence_jumps": 0,
+    "metadata_missing_pts": 0,
+    "metadata_missing_scr": 0,
+    "metadata_multiple_pts": 1257,
+    "metadata_malformed_buffers": 0,
+    "pairing": {
+      "sequence_offset_video_minus_metadata": 0,
+      "matched_pairs": 1258,
+      "coverage": 1.0,
+      "median_video_minus_first_payload_ms": -0.000645,
+      "mad_ms": 0.000259,
+      "reliable": true
+    }
+  },
+  "anomaly_count_95_to_97ms": 202
+}

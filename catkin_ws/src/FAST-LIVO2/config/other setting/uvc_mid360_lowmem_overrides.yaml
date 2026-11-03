@@ -1,0 +1,19 @@
+# Low-memory overrides for live UVC + MID360 runs.
+# Load after uvc_mid360.yaml.
+
+local_map:
+  map_sliding_en: true
+  half_map_size: 60
+  sliding_thresh: 5
+
+publish:
+  dense_map_en: false
+  pub_effect_point_en: false
+  pub_plane_en: false
+  pub_scan_num: 5
+
+pcd_save:
+  pcd_save_en: false
+  colmap_output_en: false
+  filter_size_pcd: 0.2
+  interval: 10

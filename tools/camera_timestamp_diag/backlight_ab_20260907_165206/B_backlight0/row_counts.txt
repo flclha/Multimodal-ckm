@@ -1,0 +1,3 @@
+  1317 /home/nuc/versions/version5/tools/camera_timestamp_diag/backlight_ab_20260907_165206/B_backlight0/video_frames.csv
+  1318 /home/nuc/versions/version5/tools/camera_timestamp_diag/backlight_ab_20260907_165206/B_backlight0/metadata_frames.csv
+  2635 total

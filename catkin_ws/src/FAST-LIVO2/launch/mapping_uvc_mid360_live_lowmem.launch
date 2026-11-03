@@ -1,0 +1,27 @@
+<launch>
+  <!-- Low-memory live mapping: disables accumulated PCD/Colmap saving and enables local map sliding. -->
+  <arg name="rviz" default="true" />
+  <arg name="car_tf" default="true" />
+  <arg name="mid360_frame" default="aft_mapped" />
+  <arg name="car_frame" default="tracer_base" />
+
+  <rosparam command="load" file="$(find fast_livo)/config/uvc_mid360.yaml" />
+  <rosparam command="load" file="$(find fast_livo)/config/uvc_mid360_lowmem_overrides.yaml" />
+
+  <node pkg="fast_livo" type="fastlivo_mapping" name="laserMapping" output="screen">
+    <rosparam file="$(find fast_livo)/config/camera_uvc.yaml" />
+  </node>
+
+  <node if="$(arg car_tf)" pkg="fast_livo" type="mid360_to_car_tf.py" name="mid360_to_car_tf" output="screen">
+    <param name="odom_topic" type="string" value="/aft_mapped_to_init" />
+    <param name="mid360_frame" type="string" value="$(arg mid360_frame)" />
+    <param name="car_frame" type="string" value="$(arg car_frame)" />
+    <rosparam param="heading_axis">[1.0, 0.0, 0.0]</rosparam>
+    <param name="yaw_offset_deg" type="double" value="0.0" />
+    <param name="use_initial_mount_calibration" type="bool" value="true" />
+  </node>
+
+  <group if="$(arg rviz)">
+    <node launch-prefix="nice" pkg="rviz" type="rviz" name="rviz" args="-d $(find fast_livo)/rviz_cfg/fast_livo2.rviz" />
+  </group>
+</launch>

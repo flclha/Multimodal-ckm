@@ -1,0 +1,48 @@
+%YAML:1.0
+#--------------------------------------------------------------------------------------------
+# UVC Camera Parameters. Adjust them!
+#--------------------------------------------------------------------------------------------
+DeviceName: "/dev/video0"
+TopicName: "uvc_camera/image"
+
+TriggerEnable: 1 # 0 stands for Off, 1 stands for On
+
+# Version5 Camera time: V4L2 SOE mapped into the MID360 hardware clock domain,
+# then shifted from exposure start to exposure center and by one fixed offset.
+TimestampSource: "v4l2_soe_lidar_clock"
+Stm32TriggerPath: "/home/nuc/stm32_trigger_time"
+ClockOffsetPath: "/home/nuc/mid360_clock_offset"
+LidarTimeSharePath: "/home/nuc/timeshare"
+# Per-frame raw V4L2 timing evidence for reproducible offline version4/version5
+# comparisons. This topic is diagnostic only; it does not affect image stamps.
+V4l2TimingTopic: "/uvc_camera/v4l2_timing"
+Stm32TriggerPeriodUs: 100000
+# The measured comparison favored zero phase. Keep this adjustable for future
+# STRB/oscilloscope verification.
+Stm32TriggerPhaseUs: 0
+# MID360 reported local_time - STM32/PPS source time averaged -103.770 us.
+# Apply delta_pps = STM32_PPS - MID360_integer_second in nanoseconds.
+Stm32PpsMinusMid360IntegerNs: -103770
+Stm32SequenceResetThreshold: 100
+Stm32TriggerToExposureCenterUs: 0
+# Diagnostic run only: preserve the raw mapped V4L2 timestamp without offsets.
+V4l2SoeToExposureCenterUs: 0
+# Static residual calibration offset after exposure-center compensation.
+CameraCalibrationOffsetUs: 0
+image_scale: 1 # 1 0.5
+
+Width: 1920
+Height: 1080
+PixelFormat: "MJPG"
+FrameRate: 10
+
+# UVC specific parameters
+Backlight: 0 # Free-run A/B test only
+
+# Exposure settings
+ExposureAutoMode: 0 # Manual: keep every frame's exposure duration deterministic
+Exposure: 156 # Camera manual exposure mode 1: 6 ms
+ExposureTimeLower: 100 # Informational only; not applied by this UVC driver
+ExposureTimeUpper: 10000 # Informational only; not applied by this UVC driver
+
+Gain: 120 # Sensor gain

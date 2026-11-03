@@ -1,0 +1,63 @@
+%YAML:1.0
+#--------------------------------------------------------------------------------------------
+# UVC Camera Parameters. Adjust them!
+#--------------------------------------------------------------------------------------------
+DeviceName: "/dev/video0"
+TopicName: "uvc_camera/image"
+
+TriggerEnable: 1 # 0 stands for Off, 1 stands for On
+
+# Version5 relative-time synchronization. MID360 PPS/GPRMC hardware time is
+# the public time domain. A sliding affine V4L2-to-MID360 fit publishes Camera
+# time; PPS only slowly constrains its intercept and never snaps a frame to a
+# 100 ms Trigger grid. No ROS callback/arrival time is used for image stamps.
+TimestampSource: "v4l2_mid360_affine"
+Stm32TriggerPath: "/home/nuc/stm32_trigger_time"
+ClockOffsetPath: "/home/nuc/mid360_clock_offset"
+LidarTimeSharePath: "/home/nuc/timeshare"
+# Per-frame raw V4L2 timing evidence for reproducible offline version4/version5
+# comparisons. This topic is diagnostic only; it does not affect image stamps.
+V4l2TimingTopic: "/uvc_camera/v4l2_timing"
+Stm32TriggerPeriodUs: 100000
+# The measured comparison favored zero phase. Keep this adjustable for future
+# STRB/oscilloscope verification.
+Stm32TriggerPhaseUs: 0
+# MID360 reported local_time - STM32/PPS source time averaged -103.770 us.
+# Apply delta_pps = STM32_PPS - MID360_integer_second in nanoseconds.
+Stm32PpsMinusMid360IntegerNs: -103770
+Stm32SequenceResetThreshold: 100
+Stm32TriggerToExposureCenterUs: 4760
+# Static residual offset after Trigger-to-exposure-center compensation.
+CameraCalibrationOffsetUs: 0
+# Sliding V4L2-to-MID360 affine mapping: t_mid360 = a*t_v4l2 + b.
+# a is constrained to +/- 2000 ppm, enough to observe clock-rate bias without
+# allowing one noisy window to alter the time scale excessively.
+V4l2AffineWindowFrames: 120
+V4l2AffineMinFrames: 20
+V4l2AffineMaxPpm: 2000
+# PPS grid is only a slow intercept constraint; it never publishes grid time.
+V4l2PpsAnchorGain: 0.02
+V4l2PpsAnchorMaxResidualUs: 20000
+V4l2PpsAnchorMaxStepUs: 100
+# Leave zero until the V4L2 driver reports timestamp semantics. If its flags
+# explicitly say SOE, this should be 3000 us for a 6 ms exposure center. Do
+# not use 4760 us here: trigger-to-SOE is already before the V4L2 SOE stamp.
+V4l2TimestampToExposureCenterUs: 0
+
+image_scale: 1 # 1 0.5
+
+Width: 1920
+Height: 1080
+PixelFormat: "MJPG"
+FrameRate: 10
+
+# UVC specific parameters
+Backlight: 2 # Set to 2 for hardware trigger
+
+# Exposure settings
+ExposureAutoMode: 0 # Manual: keep every frame's exposure duration deterministic
+Exposure: 156 # Camera manual exposure mode 1: 6 ms
+ExposureTimeLower: 100 # Informational only; not applied by this UVC driver
+ExposureTimeUpper: 10000 # Informational only; not applied by this UVC driver
+
+Gain: 120 # Sensor gain

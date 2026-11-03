@@ -1,0 +1,1064 @@
+#include <ros/ros.h>
+#include <image_transport/image_transport.h>
+#include <cv_bridge/cv_bridge.h>
+#include <sensor_msgs/Image.h>
+#include <opencv2/opencv.hpp>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/ioctl.h>
+#include <linux/videodev2.h>
+#include <signal.h>
+#include <cstring>
+#include <vector>
+#include <chrono>
+#include <thread>
+#include <atomic>
+#include <algorithm>
+#include <ctime>
+#include <cstdlib>
+#include <fstream>
+
+using namespace std;
+
+struct time_stamp {
+  int64_t high;
+  int64_t low;
+};
+volatile time_stamp *pointt = (volatile time_stamp *)MAP_FAILED;
+volatile time_stamp *clock_offset_pointt = (volatile time_stamp *)MAP_FAILED;
+volatile time_stamp *lidar_timeshare_pointt = (volatile time_stamp *)MAP_FAILED;
+
+bool exit_flag = false;
+int width = 640, height = 480; // 默认分辨率，可从参数调整
+image_transport::Publisher pub;
+float image_scale = 1.0;
+int trigger_enable = 1;
+string device_name = "/dev/video0"; // 默认设备
+string pixel_format = "YUYV";
+int frame_rate = 0;
+int timestamp_wait_ms = 30;
+string timestamp_source = "stm32_trigger_shared";
+string stm32_trigger_path = "/home/nuc/stm32_trigger_time";
+string clock_offset_path = "/home/nuc/mid360_clock_offset";
+string lidar_timeshare_path = "/home/nuc/timeshare";
+int64_t stm32_trigger_period_us = 100000;
+int64_t stm32_trigger_to_exposure_center_us = 4760;
+int64_t stm32_trigger_phase_us = 0;
+int64_t stm32_pps_minus_mid360_integer_ns = 0;
+uint32_t stm32_sequence_reset_threshold = 100;
+int64_t camera_calibration_offset_us = 0;
+int stm32_v4l2_init_frames = 20;
+int64_t stm32_v4l2_init_max_residual_ns = 20000000LL;
+int64_t last_trigger_seq = 0;
+int64_t last_predicted_trigger_time_ns = 0;
+int64_t last_mid360_pps_epoch_ns = 0;
+int64_t last_stm32_pps_epoch_ns = 0;
+int64_t last_trigger_index_in_second = -1;
+uint32_t last_camera_sequence = 0;
+bool camera_sequence_initialized = false;
+int64_t last_camera_stamp_ns = 0;
+uint64_t hardware_stamp_count = 0;
+uint64_t fallback_stamp_count = 0;
+uint64_t duplicate_frame_drop_count = 0;
+std::ofstream time_diag_csv;
+
+struct V4L2BootstrapSample {
+  uint32_t sequence = 0;
+  int64_t mapped_mid360_time_ns = 0;
+};
+std::vector<V4L2BootstrapSample> v4l2_bootstrap_samples;
+
+bool ReadCommittedValue(volatile time_stamp *source, int64_t &seq,
+                        int64_t &value) {
+  if (source == MAP_FAILED) return false;
+  for (int attempt = 0; attempt < 4; ++attempt) {
+    const int64_t seq_before = source->high;
+    std::atomic_thread_fence(std::memory_order_acquire);
+    const int64_t committed_value = source->low;
+    std::atomic_thread_fence(std::memory_order_acquire);
+    const int64_t seq_after = source->high;
+    if (seq_before == seq_after && seq_after > 0 &&
+        (seq_after & 1) == 0) {
+      seq = seq_after;
+      value = committed_value;
+      return true;
+    }
+    std::this_thread::yield();
+  }
+  return false;
+}
+
+bool ReadCommittedTimestamp(int64_t &seq, int64_t &stamp_ns) {
+  return ReadCommittedValue(pointt, seq, stamp_ns) && stamp_ns > 0;
+}
+
+bool ReadLidarTimeShare(int64_t &seq, int64_t &stamp_ns) {
+  return ReadCommittedValue(lidar_timeshare_pointt, seq, stamp_ns) &&
+         stamp_ns > 0;
+}
+
+int64_t TimespecToNs(const struct timespec &ts) {
+  return static_cast<int64_t>(ts.tv_sec) * 1000000000LL + ts.tv_nsec;
+}
+
+bool V4L2CaptureHostRealtimeNs(const struct v4l2_buffer &buf,
+                               int64_t &host_realtime_ns) {
+  const int64_t buffer_ns = static_cast<int64_t>(buf.timestamp.tv_sec) *
+                                1000000000LL +
+                            static_cast<int64_t>(buf.timestamp.tv_usec) *
+                                1000LL;
+  if (buffer_ns <= 0) return false;
+
+  if ((buf.flags & V4L2_BUF_FLAG_TIMESTAMP_MASK) ==
+      V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC) {
+    struct timespec realtime_now, monotonic_now;
+    if (clock_gettime(CLOCK_REALTIME, &realtime_now) != 0 ||
+        clock_gettime(CLOCK_MONOTONIC, &monotonic_now) != 0) {
+      return false;
+    }
+    host_realtime_ns = buffer_ns + TimespecToNs(realtime_now) -
+                       TimespecToNs(monotonic_now);
+  } else {
+    host_realtime_ns = buffer_ns;
+  }
+  return true;
+}
+
+bool V4L2MappedMid360TimeNs(const struct v4l2_buffer &buf,
+                            int64_t &mid360_time_ns) {
+  int64_t host_capture_ns = 0;
+  int64_t offset_seq = 0;
+  int64_t host_minus_lidar_ns = 0;
+  if (!V4L2CaptureHostRealtimeNs(buf, host_capture_ns) ||
+      !ReadCommittedValue(clock_offset_pointt, offset_seq,
+                          host_minus_lidar_ns)) {
+    return false;
+  }
+  mid360_time_ns = host_capture_ns - host_minus_lidar_ns;
+  return mid360_time_ns > 0;
+}
+
+int64_t FallbackNowInLidarClockDomainNs() {
+  const int64_t now_ns = ros::Time::now().toNSec();
+  int64_t offset_seq = 0;
+  int64_t host_minus_lidar_ns = 0;
+  if (ReadCommittedValue(clock_offset_pointt, offset_seq, host_minus_lidar_ns)) {
+    return now_ns - host_minus_lidar_ns;
+  }
+  ROS_WARN_THROTTLE(
+      2.0,
+      "MID360 clock offset is unavailable at %s; using raw ros::Time::now() "
+      "fallback, which may be outside the LiDAR/IMU clock domain",
+      clock_offset_path.c_str());
+  return now_ns;
+}
+
+int64_t FloorDiv(int64_t value, int64_t divisor) {
+  if (divisor <= 0) return 0;
+  int64_t quotient = value / divisor;
+  const int64_t remainder = value % divisor;
+  if (remainder < 0) --quotient;
+  return quotient;
+}
+
+int64_t NormalizedTriggerPhaseNs() {
+  const int64_t period_ns = stm32_trigger_period_us * 1000LL;
+  if (period_ns <= 0) return 0;
+  int64_t phase_ns = (stm32_trigger_phase_us * 1000LL) % period_ns;
+  if (phase_ns < 0) phase_ns += period_ns;
+  return phase_ns;
+}
+
+int64_t AlignToNearestTriggerGridNs(int64_t reference_ns) {
+  const int64_t period_ns = stm32_trigger_period_us * 1000LL;
+  const int64_t phase_ns = NormalizedTriggerPhaseNs();
+  if (period_ns <= 0) return reference_ns;
+  const int64_t shifted = reference_ns - phase_ns;
+  int64_t cycles = FloorDiv(shifted, period_ns);
+  const int64_t remainder = shifted - cycles * period_ns;
+  if (remainder >= period_ns / 2) ++cycles;
+  return cycles * period_ns + phase_ns;
+}
+
+int64_t AlignToPreviousTriggerGridNs(int64_t reference_ns) {
+  const int64_t period_ns = stm32_trigger_period_us * 1000LL;
+  const int64_t phase_ns = NormalizedTriggerPhaseNs();
+  if (period_ns <= 0) return reference_ns;
+  return FloorDiv(reference_ns - phase_ns, period_ns) * period_ns + phase_ns;
+}
+
+int64_t FloorToSecondNs(int64_t timestamp_ns) {
+  constexpr int64_t kSecondNs = 1000000000LL;
+  return FloorDiv(timestamp_ns, kSecondNs) * kSecondNs;
+}
+
+bool BootstrapTriggerGridFromV4L2(const struct v4l2_buffer &buf,
+                                  int64_t &trigger_seq,
+                                  int64_t &trigger_time_ns) {
+  constexpr int64_t kSecondNs = 1000000000LL;
+  const int64_t period_ns = stm32_trigger_period_us * 1000LL;
+  if (period_ns <= 0 || kSecondNs % period_ns != 0) return false;
+
+  int64_t mapped_mid360_time_ns = 0;
+  if (!V4L2MappedMid360TimeNs(buf, mapped_mid360_time_ns)) {
+    ROS_WARN_THROTTLE(1.0, "Waiting for V4L2-to-MID360 clock mapping before "
+                      "initial Trigger matching");
+    return false;
+  }
+
+  if (!v4l2_bootstrap_samples.empty() &&
+      buf.sequence <= v4l2_bootstrap_samples.back().sequence) {
+    ROS_WARN("Restarting V4L2 bootstrap because Camera sequence is not "
+             "strictly increasing: prev=%u current=%u",
+             v4l2_bootstrap_samples.back().sequence, buf.sequence);
+    v4l2_bootstrap_samples.clear();
+  }
+  v4l2_bootstrap_samples.push_back({buf.sequence, mapped_mid360_time_ns});
+  if (static_cast<int>(v4l2_bootstrap_samples.size()) <
+      stm32_v4l2_init_frames) {
+    ROS_INFO("Collecting V4L2 bootstrap samples: %zu/%d",
+             v4l2_bootstrap_samples.size(), stm32_v4l2_init_frames);
+    return false;
+  }
+
+  const auto &first = v4l2_bootstrap_samples.front();
+  const auto &last = v4l2_bootstrap_samples.back();
+  const int64_t phase_ns = NormalizedTriggerPhaseNs();
+  const int64_t effective_phase_ns =
+      phase_ns + stm32_pps_minus_mid360_integer_ns;
+  const int64_t camera_offset_ns =
+      (stm32_trigger_to_exposure_center_us + camera_calibration_offset_us) *
+      1000LL;
+  const int64_t first_second_ns = FloorToSecondNs(first.mapped_mid360_time_ns);
+  const int64_t triggers_per_second = kSecondNs / period_ns;
+  bool found = false;
+  int64_t best_first_trigger_ns = 0;
+  int64_t best_sum_abs_residual_ns = 0;
+  int64_t best_max_residual_ns = 0;
+
+  // The only V4L2 use in the timestamp path: choose the one initial Trigger
+  // phase whose whole sequence best agrees with the version4 MID360 mapping.
+  for (int second_offset = -1; second_offset <= 1; ++second_offset) {
+    const int64_t pps_epoch_ns = first_second_ns + second_offset * kSecondNs;
+    for (int k = 0; k < triggers_per_second; ++k) {
+      const int64_t first_trigger_ns =
+          pps_epoch_ns + effective_phase_ns + k * period_ns;
+      int64_t sum_abs_residual_ns = 0;
+      int64_t max_residual_ns = 0;
+      for (const auto &sample : v4l2_bootstrap_samples) {
+        const uint32_t frame_delta = sample.sequence - first.sequence;
+        const int64_t predicted_camera_ns =
+            first_trigger_ns + static_cast<int64_t>(frame_delta) * period_ns +
+            camera_offset_ns;
+        const int64_t residual_ns =
+            std::llabs(sample.mapped_mid360_time_ns - predicted_camera_ns);
+        sum_abs_residual_ns += residual_ns;
+        max_residual_ns = std::max(max_residual_ns, residual_ns);
+      }
+      if (!found || sum_abs_residual_ns < best_sum_abs_residual_ns) {
+        found = true;
+        best_first_trigger_ns = first_trigger_ns;
+        best_sum_abs_residual_ns = sum_abs_residual_ns;
+        best_max_residual_ns = max_residual_ns;
+      }
+    }
+  }
+
+  const double mean_residual_ms =
+      best_sum_abs_residual_ns / 1000000.0 / v4l2_bootstrap_samples.size();
+  if (!found || best_max_residual_ns > stm32_v4l2_init_max_residual_ns) {
+    ROS_WARN("V4L2 bootstrap rejected: mean_residual=%.3f ms max_residual=%.3f "
+             "ms threshold=%.3f ms. Retrying with a new 20-frame window.",
+             mean_residual_ms, best_max_residual_ns / 1000000.0,
+             stm32_v4l2_init_max_residual_ns / 1000000.0);
+    v4l2_bootstrap_samples.clear();
+    return false;
+  }
+
+  const uint32_t sequence_delta = last.sequence - first.sequence;
+  trigger_time_ns =
+      best_first_trigger_ns + static_cast<int64_t>(sequence_delta) * period_ns;
+  trigger_seq = FloorDiv(trigger_time_ns - effective_phase_ns, period_ns);
+  int64_t index_in_second = trigger_seq % triggers_per_second;
+  if (index_in_second < 0) index_in_second += triggers_per_second;
+
+  int64_t lidar_seq = 0;
+  int64_t lidar_stamp_ns = 0;
+  if (!ReadLidarTimeShare(lidar_seq, lidar_stamp_ns)) return false;
+  last_trigger_seq = trigger_seq;
+  last_predicted_trigger_time_ns = trigger_time_ns;
+  last_camera_sequence = last.sequence;
+  last_mid360_pps_epoch_ns = FloorToSecondNs(lidar_stamp_ns);
+  const int64_t trigger_mid360_second_ns =
+      FloorToSecondNs(trigger_time_ns - effective_phase_ns);
+  last_stm32_pps_epoch_ns =
+      trigger_mid360_second_ns + stm32_pps_minus_mid360_integer_ns;
+  last_trigger_index_in_second = index_in_second;
+  camera_sequence_initialized = true;
+  ROS_INFO("Locked STM32 Trigger grid from %zu V4L2 bootstrap frames: "
+           "index_in_second=%ld mean_residual=%.3f ms max_residual=%.3f ms. "
+           "V4L2 now only monitors alignment.",
+           v4l2_bootstrap_samples.size(), index_in_second, mean_residual_ms,
+           best_max_residual_ns / 1000000.0);
+  v4l2_bootstrap_samples.clear();
+  return true;
+}
+
+void MonitorV4L2TriggerAlignment(const struct v4l2_buffer &buf,
+                                 int64_t camera_time_ns) {
+  int64_t mapped_mid360_time_ns = 0;
+  if (!V4L2MappedMid360TimeNs(buf, mapped_mid360_time_ns)) return;
+  const int64_t residual_ns =
+      std::llabs(mapped_mid360_time_ns - camera_time_ns);
+  if (residual_ns > stm32_v4l2_init_max_residual_ns) {
+    ROS_WARN_THROTTLE(
+        1.0,
+        "V4L2 monitor: generated STM32 Camera timestamp differs from V4L2 "
+        "mapped MID360 time by %.3f ms; no automatic timestamp adjustment",
+        residual_ns / 1000000.0);
+  }
+}
+
+bool PredictTriggerFromMid360Grid(uint32_t frame_sequence, int64_t &trigger_seq,
+                                  int64_t &trigger_time_ns) {
+  const int64_t period_ns = stm32_trigger_period_us * 1000LL;
+  int64_t lidar_seq = 0;
+  int64_t lidar_stamp_ns = 0;
+  if (period_ns <= 0 || !ReadLidarTimeShare(lidar_seq, lidar_stamp_ns)) {
+    return false;
+  }
+
+  if (!camera_sequence_initialized || last_predicted_trigger_time_ns <= 0) {
+    // MID360 is already disciplined by the STM32 PPS/GPRMC signal. Use its
+    // hardware time as the common STM32 time-axis anchor, then place the first
+    // camera frame on the nearest 10 Hz trigger grid.
+    trigger_time_ns = AlignToNearestTriggerGridNs(lidar_stamp_ns);
+  } else {
+    const uint32_t frame_delta = frame_sequence - last_camera_sequence;
+    trigger_time_ns =
+        last_predicted_trigger_time_ns + static_cast<int64_t>(frame_delta) * period_ns;
+  }
+
+  if (trigger_time_ns <= 0) return false;
+  trigger_seq = trigger_time_ns / period_ns;
+  return true;
+}
+
+bool PredictTriggerFromStm32PpsGrid(uint32_t frame_sequence,
+                                    int64_t &trigger_seq,
+                                    int64_t &trigger_time_ns) {
+  constexpr int64_t kSecondNs = 1000000000LL;
+  const int64_t period_ns = stm32_trigger_period_us * 1000LL;
+  const int64_t phase_ns = NormalizedTriggerPhaseNs();
+  int64_t lidar_seq = 0;
+  int64_t lidar_stamp_ns = 0;
+  if (period_ns <= 0 || !ReadLidarTimeShare(lidar_seq, lidar_stamp_ns)) {
+    return false;
+  }
+
+  if (kSecondNs % period_ns != 0) {
+    ROS_ERROR_THROTTLE(
+        2.0,
+        "STM32 Trigger period must divide one second exactly: period_ns=%ld",
+        period_ns);
+    return false;
+  }
+  const int64_t triggers_per_second = kSecondNs / period_ns;
+  const int64_t observed_pps_epoch_ns = FloorToSecondNs(lidar_stamp_ns);
+  const int64_t corrected_stm32_pps_epoch_ns =
+      observed_pps_epoch_ns + stm32_pps_minus_mid360_integer_ns;
+  const int64_t effective_phase_ns =
+      phase_ns + stm32_pps_minus_mid360_integer_ns;
+
+  if (!camera_sequence_initialized || last_predicted_trigger_time_ns <= 0) {
+    return false;
+  }
+  const uint32_t frame_delta = frame_sequence - last_camera_sequence;
+  trigger_time_ns = last_predicted_trigger_time_ns +
+                    static_cast<int64_t>(frame_delta) * period_ns;
+
+  if (observed_pps_epoch_ns > last_mid360_pps_epoch_ns) {
+    // Preserve the Camera frame association established by V4L2 sequence.
+    // Crossing a MID360/GPRMC integer second only corrects the theoretical
+    // STM32 Trigger grid epoch; it never performs a nearest-frame rematch.
+    int64_t index_in_second =
+        (last_trigger_index_in_second + static_cast<int64_t>(frame_delta)) %
+        triggers_per_second;
+    if (index_in_second < 0) index_in_second += triggers_per_second;
+
+    const int64_t predicted_trigger_time_ns = trigger_time_ns;
+    trigger_time_ns = corrected_stm32_pps_epoch_ns + phase_ns +
+                      index_in_second * period_ns;
+    const double correction_ms =
+        (trigger_time_ns - predicted_trigger_time_ns) / 1000000.0;
+    ROS_INFO("MID360 PPS epoch advanced: old=%.9f new=%.9f "
+             "index_in_second=%ld trigger_grid_correction=%.3f ms",
+             last_mid360_pps_epoch_ns / 1e9,
+             observed_pps_epoch_ns / 1e9,
+             index_in_second, correction_ms);
+    last_mid360_pps_epoch_ns = observed_pps_epoch_ns;
+    last_stm32_pps_epoch_ns = corrected_stm32_pps_epoch_ns;
+    last_trigger_index_in_second = index_in_second;
+  } else if (observed_pps_epoch_ns < last_mid360_pps_epoch_ns) {
+    ROS_WARN_THROTTLE(
+        2.0,
+        "MID360/GPRMC integer-second epoch moved backward: current=%.9f "
+        "last=%.9f; keeping the existing Camera Trigger grid",
+        observed_pps_epoch_ns / 1e9, last_mid360_pps_epoch_ns / 1e9);
+    last_trigger_index_in_second =
+        (last_trigger_index_in_second + static_cast<int64_t>(frame_delta)) %
+        triggers_per_second;
+    if (last_trigger_index_in_second < 0) {
+      last_trigger_index_in_second += triggers_per_second;
+    }
+  } else {
+    last_trigger_index_in_second =
+        (last_trigger_index_in_second + static_cast<int64_t>(frame_delta)) %
+        triggers_per_second;
+    if (last_trigger_index_in_second < 0) {
+      last_trigger_index_in_second += triggers_per_second;
+    }
+  }
+
+  if (trigger_time_ns <= 0) return false;
+  trigger_seq = FloorDiv(trigger_time_ns - effective_phase_ns, period_ns);
+
+  const int64_t latest_expected_trigger_ns =
+      FloorDiv(lidar_stamp_ns - effective_phase_ns, period_ns) * period_ns +
+      effective_phase_ns;
+  const double anchor_error_ms =
+      (trigger_time_ns - latest_expected_trigger_ns) / 1000000.0;
+  if (std::abs(anchor_error_ms) > 200.0) {
+    ROS_WARN_THROTTLE(
+        2.0,
+        "STM32 PPS-grid model is more than two periods from the latest "
+        "PPS-disciplined LiDAR clock observation: error=%.3f ms",
+        anchor_error_ms);
+  }
+  return true;
+}
+
+void OpenTimeDiagCsvIfRequested() {
+  const char *path = std::getenv("FAST_LIVO_TIME_DIAG_CSV");
+  if (!path || !*path || time_diag_csv.is_open()) return;
+  time_diag_csv.open(path, std::ios::out | std::ios::trunc);
+  if (!time_diag_csv.is_open()) {
+    ROS_WARN("Failed to open FAST_LIVO_TIME_DIAG_CSV=%s", path);
+    return;
+  }
+  time_diag_csv
+      << "frame_index,frame_seq,pps_time_ns,trigger_index,trigger_time_ns,"
+         "camera_time_ns,camera_period_ms,camera_calibration_offset_us,"
+         "v4l2_flags,buf_sequence,buf_bytesused\n";
+}
+
+void SignalHandler(int signal) {
+  if (signal == SIGINT) {
+    fprintf(stderr, "\nReceived Ctrl+C, exiting...\n");
+    exit_flag = true;
+  }
+}
+
+void SetupSignalHandler() {
+  struct sigaction sigIntHandler;
+  sigIntHandler.sa_handler = SignalHandler;
+  sigemptyset(&sigIntHandler.sa_mask);
+  sigIntHandler.sa_flags = 0;
+  sigaction(SIGINT, &sigIntHandler, NULL);
+}
+
+bool set_v4l2_control(int fd, int id, int value) {
+  struct v4l2_control ctrl;
+  ctrl.id = id;
+  ctrl.value = value;
+  if (ioctl(fd, VIDIOC_S_CTRL, &ctrl) < 0) {
+    perror("VIDIOC_S_CTRL");
+    return false;
+  }
+  return true;
+}
+
+bool get_v4l2_control(int fd, int id, int &value) {
+  struct v4l2_control ctrl;
+  ctrl.id = id;
+  if (ioctl(fd, VIDIOC_G_CTRL, &ctrl) < 0) {
+    perror("VIDIOC_G_CTRL");
+    return false;
+  }
+  value = ctrl.value;
+  return true;
+}
+
+uint32_t pixelFormatFromString(const string &format) {
+  if (format == "MJPG" || format == "MJPEG") return V4L2_PIX_FMT_MJPEG;
+  if (format == "YUYV") return V4L2_PIX_FMT_YUYV;
+
+  ROS_WARN("Unsupported PixelFormat '%s'. Falling back to YUYV.", format.c_str());
+  return V4L2_PIX_FMT_YUYV;
+}
+
+bool set_v4l2_frame_rate(int fd, int fps) {
+  if (fps <= 0) return true;
+
+  struct v4l2_streamparm parm;
+  memset(&parm, 0, sizeof(parm));
+  parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+  parm.parm.capture.timeperframe.numerator = 1;
+  parm.parm.capture.timeperframe.denominator = fps;
+
+  if (ioctl(fd, VIDIOC_S_PARM, &parm) < 0) {
+    perror("VIDIOC_S_PARM");
+    return false;
+  }
+
+  ROS_INFO("Set camera frame rate to %.3f fps",
+           static_cast<double>(parm.parm.capture.timeperframe.denominator) /
+               parm.parm.capture.timeperframe.numerator);
+  return true;
+}
+
+void setParams(int fd, const string &params_file) {
+  cv::FileStorage Params(params_file, cv::FileStorage::READ);
+  if (!Params.isOpened()) {
+    string msg = "Failed to open settings file at:" + params_file;
+    ROS_ERROR_STREAM(msg.c_str());
+    exit(-1);
+  }
+  image_scale = Params["image_scale"];
+  if (image_scale < 0.1) image_scale = 1.0;
+
+  width = Params["Width"];
+  height = Params["Height"];
+  if (!Params["PixelFormat"].empty()) pixel_format = (string)Params["PixelFormat"];
+  if (!Params["FrameRate"].empty()) frame_rate = (int)Params["FrameRate"];
+  if (!Params["TimestampWaitMs"].empty())
+    timestamp_wait_ms = std::max(0, (int)Params["TimestampWaitMs"]);
+  if (!Params["TimestampSource"].empty())
+    timestamp_source = (string)Params["TimestampSource"];
+  if (!Params["Stm32TriggerPath"].empty())
+    stm32_trigger_path = (string)Params["Stm32TriggerPath"];
+  if (!Params["ClockOffsetPath"].empty())
+    clock_offset_path = (string)Params["ClockOffsetPath"];
+  if (!Params["LidarTimeSharePath"].empty())
+    lidar_timeshare_path = (string)Params["LidarTimeSharePath"];
+  if (!Params["Stm32TriggerPeriodUs"].empty())
+    stm32_trigger_period_us = (int64_t)(int)Params["Stm32TriggerPeriodUs"];
+  if (!Params["Stm32TriggerPhaseUs"].empty())
+    stm32_trigger_phase_us = (int64_t)(int)Params["Stm32TriggerPhaseUs"];
+  if (!Params["Stm32PpsMinusMid360IntegerNs"].empty())
+    stm32_pps_minus_mid360_integer_ns =
+        (int64_t)(int)Params["Stm32PpsMinusMid360IntegerNs"];
+  if (!Params["Stm32SequenceResetThreshold"].empty())
+    stm32_sequence_reset_threshold =
+        std::max(1, (int)Params["Stm32SequenceResetThreshold"]);
+  if (!Params["Stm32TriggerToExposureCenterUs"].empty())
+    stm32_trigger_to_exposure_center_us =
+        (int64_t)(int)Params["Stm32TriggerToExposureCenterUs"];
+  if (!Params["CameraCalibrationOffsetUs"].empty())
+    camera_calibration_offset_us =
+        (int64_t)(int)Params["CameraCalibrationOffsetUs"];
+  if (!Params["Stm32V4l2InitFrames"].empty())
+    stm32_v4l2_init_frames = std::max(3, (int)Params["Stm32V4l2InitFrames"]);
+  if (!Params["Stm32V4l2InitMaxResidualUs"].empty())
+    stm32_v4l2_init_max_residual_ns =
+        std::max<int64_t>(1000, (int64_t)(int)Params["Stm32V4l2InitMaxResidualUs"]) *
+        1000LL;
+
+  int backlight = Params["Backlight"];
+  int exposure_auto_mode = Params["ExposureAutoMode"];
+  int exposure = Params["Exposure"];
+  int exposure_time_lower = Params["ExposureTimeLower"];
+  int exposure_time_upper = Params["ExposureTimeUpper"];
+  int gain = Params["Gain"];
+  int gain_auto = Params["GainAuto"];
+
+  // 设置自动曝光模式
+  int exposure_mode_value;
+  std::string exposure_mode_str;
+  switch (exposure_auto_mode) {
+    case 0: // Manual
+      exposure_mode_value = 1; // Manual Mode
+      exposure_mode_str = "Manual";
+      break;
+    case 1: // Auto (使用Aperture Priority作为自动模式)
+      exposure_mode_value = 3; // Aperture Priority Mode
+      exposure_mode_str = "Aperture Priority (Auto)";
+      break;
+    case 2: // Aperture Priority
+      exposure_mode_value = 3; // Aperture Priority Mode
+      exposure_mode_str = "Aperture Priority";
+      break;
+    default:
+      exposure_mode_value = 1; // Manual Mode
+      exposure_mode_str = "Manual (default)";
+      break;
+  }
+
+  if (!set_v4l2_control(fd, V4L2_CID_EXPOSURE_AUTO, exposure_mode_value)) {
+    ROS_WARN("Failed to set auto exposure mode to %s", exposure_mode_str.c_str());
+  } else {
+    ROS_INFO("Set auto exposure mode to %s", exposure_mode_str.c_str());
+  }
+
+  // Generic V4L2 auto exposure does not provide controls for these bounds.
+  // Keep the YAML values informational instead of claiming they were applied.
+  if (exposure_auto_mode == 1) { // Auto mode (Aperture Priority)
+    ROS_WARN("Auto exposure enabled; ExposureTimeLower/Upper (%d/%d) are not applied by this UVC driver",
+             exposure_time_lower, exposure_time_upper);
+  }
+
+  // 如果是手动曝光，设置曝光时间
+  if (exposure_auto_mode == 0) { // Manual mode
+      if (!set_v4l2_control(fd, V4L2_CID_EXPOSURE_ABSOLUTE, exposure)) {
+        ROS_ERROR("Failed to set exposure time to %d", exposure);
+      } else {
+        ROS_INFO("Set manual exposure preset to %d (camera manual: 156 = 6 ms)",
+                 exposure);
+      }
+    }
+
+  // 设置backlight为2，实现硬件触发
+  if (!set_v4l2_control(fd, V4L2_CID_BACKLIGHT_COMPENSATION, 2)) {
+    ROS_ERROR("Failed to set backlight for hardware trigger");
+  } else {
+    ROS_INFO("Set backlight to 2 for hardware trigger");
+  }
+
+  // 设置增益（UVC摄像头通常只支持手动增益）
+  if (!set_v4l2_control(fd, V4L2_CID_GAIN, gain)) {
+    ROS_ERROR("Failed to set gain to %d", gain);
+  } else {
+    ROS_INFO("Set gain to %d", gain);
+  }
+
+  if (gain_auto == 1) {
+    ROS_WARN("Auto gain requested but not supported by this UVC camera. Using manual gain: %d", gain);
+  }
+}
+
+void *WorkThread(void *arg) {
+  int fd = *(int *)arg;
+  struct v4l2_format fmt;
+  memset(&fmt, 0, sizeof(fmt));
+  fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+  fmt.fmt.pix.width = width;
+  fmt.fmt.pix.height = height;
+  fmt.fmt.pix.pixelformat = pixelFormatFromString(pixel_format);
+  fmt.fmt.pix.field = V4L2_FIELD_INTERLACED;
+
+  if (ioctl(fd, VIDIOC_S_FMT, &fmt) < 0) {
+    perror("VIDIOC_S_FMT");
+    return NULL;
+  }
+  set_v4l2_frame_rate(fd, frame_rate);
+
+  char fourcc[5] = {
+      static_cast<char>(fmt.fmt.pix.pixelformat & 0xff),
+      static_cast<char>((fmt.fmt.pix.pixelformat >> 8) & 0xff),
+      static_cast<char>((fmt.fmt.pix.pixelformat >> 16) & 0xff),
+      static_cast<char>((fmt.fmt.pix.pixelformat >> 24) & 0xff),
+      '\0'};
+  ROS_INFO("Camera capture format: %ux%u %s",
+           fmt.fmt.pix.width, fmt.fmt.pix.height, fourcc);
+
+  // 请求缓冲区
+  struct v4l2_requestbuffers req;
+  memset(&req, 0, sizeof(req));
+  req.count = 4;
+  req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+  req.memory = V4L2_MEMORY_MMAP;
+
+  if (ioctl(fd, VIDIOC_REQBUFS, &req) < 0) {
+    perror("VIDIOC_REQBUFS");
+    return NULL;
+  }
+
+  vector<void *> buffers(req.count);
+  vector<size_t> buffer_lengths(req.count);
+
+  for (int i = 0; i < req.count; ++i) {
+    struct v4l2_buffer buf;
+    memset(&buf, 0, sizeof(buf));
+    buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    buf.memory = V4L2_MEMORY_MMAP;
+    buf.index = i;
+
+    if (ioctl(fd, VIDIOC_QUERYBUF, &buf) < 0) {
+      perror("VIDIOC_QUERYBUF");
+      return NULL;
+    }
+
+    buffers[i] = mmap(NULL, buf.length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, buf.m.offset);
+    if (buffers[i] == MAP_FAILED) {
+      perror("mmap");
+      return NULL;
+    }
+    buffer_lengths[i] = buf.length;
+
+    if (ioctl(fd, VIDIOC_QBUF, &buf) < 0) {
+      perror("VIDIOC_QBUF");
+      return NULL;
+    }
+  }
+
+  // 启动捕获
+  enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+  if (ioctl(fd, VIDIOC_STREAMON, &type) < 0) {
+    perror("VIDIOC_STREAMON");
+    return NULL;
+  }
+
+  while (!exit_flag && ros::ok()) {
+    struct v4l2_buffer buf;
+    memset(&buf, 0, sizeof(buf));
+    buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    buf.memory = V4L2_MEMORY_MMAP;
+
+    if (ioctl(fd, VIDIOC_DQBUF, &buf) < 0) {
+      perror("VIDIOC_DQBUF");
+      continue;
+    }
+
+    ros::Time rcv_time;
+    int64_t timestamp_ns = 0;
+    int64_t trigger_seq = 0;
+    int64_t trigger_time_ns = 0;
+    int64_t pps_time_ns = 0;
+    int trigger_index = -1;
+    double camera_period_ms = 0.0;
+    bool used_fallback_this_frame = false;
+    if (timestamp_source == "stm32_trigger_shared" ||
+        timestamp_source == "stm32_pps_phase_grid" ||
+        timestamp_source == "mid360_trigger_grid") {
+      bool got_trigger = false;
+      if (timestamp_source == "stm32_trigger_shared") {
+        got_trigger = ReadCommittedTimestamp(trigger_seq, trigger_time_ns);
+      } else if (timestamp_source == "stm32_pps_phase_grid") {
+        if (camera_sequence_initialized) {
+          const uint32_t frame_delta = buf.sequence - last_camera_sequence;
+          if (frame_delta > stm32_sequence_reset_threshold) {
+            ROS_WARN("Camera sequence reset/large jump: prev=%u current=%u "
+                     "delta=%u; restarting V4L2 bootstrap matching",
+                     last_camera_sequence, buf.sequence, frame_delta);
+            camera_sequence_initialized = false;
+            last_predicted_trigger_time_ns = 0;
+            last_trigger_index_in_second = -1;
+            v4l2_bootstrap_samples.clear();
+          }
+        }
+        if (!camera_sequence_initialized) {
+          got_trigger = BootstrapTriggerGridFromV4L2(
+              buf, trigger_seq, trigger_time_ns);
+          if (!got_trigger) {
+            ioctl(fd, VIDIOC_QBUF, &buf);
+            continue;
+          }
+        } else {
+          got_trigger = PredictTriggerFromStm32PpsGrid(
+              buf.sequence, trigger_seq, trigger_time_ns);
+        }
+      } else {
+        got_trigger = PredictTriggerFromMid360Grid(
+            buf.sequence, trigger_seq, trigger_time_ns);
+      }
+      if (!got_trigger) {
+        ++fallback_stamp_count;
+        used_fallback_this_frame = true;
+        timestamp_ns = FallbackNowInLidarClockDomainNs();
+        ROS_WARN_THROTTLE(
+            2.0,
+            "Camera trigger timestamp is unavailable for source=%s; falling back to "
+            "ros::Time::now() mapped into the MID360 clock domain "
+            "(fallback=%lu, frame_seq=%u)",
+            timestamp_source.c_str(), fallback_stamp_count, buf.sequence);
+      } else if (timestamp_source == "stm32_trigger_shared" &&
+                 trigger_seq == last_trigger_seq) {
+        ++fallback_stamp_count;
+        used_fallback_this_frame = true;
+        timestamp_ns = FallbackNowInLidarClockDomainNs();
+        ROS_WARN_THROTTLE(
+            2.0,
+            "STM32 trigger timestamp was not updated; falling back to "
+            "ros::Time::now() mapped into the MID360 clock domain "
+            "(seq=%ld, fallback=%lu, frame_seq=%u)",
+            trigger_seq, fallback_stamp_count, buf.sequence);
+      } else {
+        if (camera_sequence_initialized) {
+          const uint32_t frame_delta = buf.sequence - last_camera_sequence;
+          const int64_t trigger_delta = trigger_seq - last_trigger_seq;
+          if (frame_delta > 1) {
+            ROS_WARN(
+                "Camera sequence skipped: prev=%u current=%u missed=%u",
+                last_camera_sequence, buf.sequence, frame_delta - 1);
+          }
+          if (trigger_delta != static_cast<int64_t>(frame_delta)) {
+            ROS_WARN(
+                "STM32 trigger/frame sequence mismatch: prev_frame=%u "
+                "frame=%u frame_delta=%u prev_trigger=%ld trigger=%ld "
+                "trigger_delta=%ld",
+                last_camera_sequence, buf.sequence, frame_delta,
+                last_trigger_seq, trigger_seq, trigger_delta);
+          }
+        }
+
+        const int64_t period_ns = stm32_trigger_period_us * 1000LL;
+        if (timestamp_source == "stm32_pps_phase_grid" &&
+            last_stm32_pps_epoch_ns > 0 &&
+            last_trigger_index_in_second >= 0) {
+          pps_time_ns = last_stm32_pps_epoch_ns;
+          trigger_index = static_cast<int>(last_trigger_index_in_second);
+        } else {
+          pps_time_ns =
+              (trigger_time_ns / 1000000000LL) * 1000000000LL;
+        }
+        if (period_ns > 0 && trigger_index < 0) {
+          trigger_index =
+              static_cast<int>((trigger_time_ns - pps_time_ns) / period_ns);
+          if (trigger_index < 0 || trigger_index > 9) {
+            ROS_WARN("STM32 trigger index outside 0..9: index=%d "
+                     "trigger_time=%.9f pps_time=%.9f",
+                     trigger_index, trigger_time_ns / 1e9,
+                     pps_time_ns / 1e9);
+          }
+        }
+        timestamp_ns = trigger_time_ns +
+                       (stm32_trigger_to_exposure_center_us +
+                        camera_calibration_offset_us) *
+                           1000LL;
+        if (timestamp_source == "stm32_pps_phase_grid") {
+          MonitorV4L2TriggerAlignment(buf, timestamp_ns);
+        }
+        if (last_camera_stamp_ns > 0) {
+          camera_period_ms =
+              (timestamp_ns - last_camera_stamp_ns) / 1000000.0;
+          if (std::abs(camera_period_ms -
+                       stm32_trigger_period_us / 1000.0) > 5.0) {
+            ROS_WARN(
+                "Camera timestamp period abnormal: %.3f ms "
+                "(frame_seq=%u trigger_seq=%ld)",
+                camera_period_ms, buf.sequence, trigger_seq);
+          }
+        }
+        last_trigger_seq = trigger_seq;
+        last_predicted_trigger_time_ns = trigger_time_ns;
+        ++hardware_stamp_count;
+      }
+      last_camera_sequence = buf.sequence;
+      camera_sequence_initialized = true;
+    } else {
+      ++fallback_stamp_count;
+      used_fallback_this_frame = true;
+      timestamp_ns = FallbackNowInLidarClockDomainNs();
+      ROS_WARN_THROTTLE(
+          2.0,
+          "Unsupported TimestampSource='%s'. Version5 expects "
+          "'stm32_trigger_shared', 'stm32_pps_phase_grid', or "
+          "'mid360_trigger_grid'; falling back to ros::Time::now() mapped "
+          "into the MID360 clock domain (fallback=%lu, frame_seq=%u)",
+          timestamp_source.c_str(), fallback_stamp_count, buf.sequence);
+    }
+
+    if (timestamp_ns <= last_camera_stamp_ns) {
+      if (used_fallback_this_frame) {
+        timestamp_ns = last_camera_stamp_ns + stm32_trigger_period_us * 1000LL;
+        ROS_WARN_THROTTLE(
+            2.0,
+            "Adjusted fallback camera timestamp to keep monotonic order: "
+            "current=%ld last=%ld",
+            timestamp_ns, last_camera_stamp_ns);
+      } else {
+        ++duplicate_frame_drop_count;
+        ROS_WARN_THROTTLE(
+            5.0, "Dropping non-monotonic camera timestamp: current=%ld last=%ld",
+            timestamp_ns, last_camera_stamp_ns);
+        ioctl(fd, VIDIOC_QBUF, &buf);
+        continue;
+      }
+    }
+    last_camera_stamp_ns = timestamp_ns;
+    rcv_time.fromNSec(timestamp_ns);
+    OpenTimeDiagCsvIfRequested();
+    if (time_diag_csv.is_open()) {
+      time_diag_csv << hardware_stamp_count << "," << buf.sequence << ","
+                    << pps_time_ns << "," << trigger_index << ","
+                    << trigger_time_ns << "," << timestamp_ns << ","
+                    << camera_period_ms << "," << camera_calibration_offset_us << ","
+                    << buf.flags << ","
+                    << buf.sequence << "," << buf.bytesused << "\n";
+      time_diag_csv.flush();
+    }
+
+    cv::Mat rgb;
+    if (fmt.fmt.pix.pixelformat == V4L2_PIX_FMT_MJPEG) {
+      cv::Mat mjpeg(1, buf.bytesused, CV_8UC1, buffers[buf.index]);
+      cv::Mat bgr = cv::imdecode(mjpeg, cv::IMREAD_COLOR);
+      if (bgr.empty()) {
+        ROS_WARN_THROTTLE(2.0, "Failed to decode MJPG frame");
+        ioctl(fd, VIDIOC_QBUF, &buf);
+        continue;
+      }
+      cv::cvtColor(bgr, rgb, cv::COLOR_BGR2RGB);
+    } else {
+      cv::Mat yuyv(height, width, CV_8UC2, buffers[buf.index]);
+      cv::cvtColor(yuyv, rgb, cv::COLOR_YUV2RGB_YUYV);
+    }
+
+    if (image_scale > 0.0 && image_scale != 1.0) {
+      cv::resize(rgb, rgb, cv::Size(rgb.cols * image_scale, rgb.rows * image_scale), cv::INTER_LINEAR);
+    }
+
+    sensor_msgs::ImagePtr msg = cv_bridge::CvImage(std_msgs::Header(), "rgb8", rgb).toImageMsg();
+    msg->header.seq = buf.sequence;
+    msg->header.stamp = rcv_time;
+    pub.publish(msg);
+    ROS_INFO("STM32 camera sync: frame_seq=%u pps_time=%.9f "
+             "trigger_index=%d trigger_time=%.9f camera_time=%.9f "
+             "image.header.stamp=%.9f period_ms=%.3f",
+             buf.sequence, pps_time_ns / 1e9, trigger_index,
+             trigger_time_ns / 1e9, timestamp_ns / 1e9,
+             msg->header.stamp.toSec(), camera_period_ms);
+    ROS_INFO_STREAM_THROTTLE(
+        10.0, "Camera timestamp counters: hardware=" << hardware_stamp_count
+              << " fallback=" << fallback_stamp_count
+              << " dropped=" << duplicate_frame_drop_count
+              << " source=" << timestamp_source
+              << " v4l2_flags=0x" << std::hex << buf.flags << std::dec);
+
+    if (ioctl(fd, VIDIOC_QBUF, &buf) < 0) {
+      perror("VIDIOC_QBUF");
+    }
+  }
+
+  // 停止捕获
+  if (ioctl(fd, VIDIOC_STREAMOFF, &type) < 0) {
+    perror("VIDIOC_STREAMOFF");
+  }
+
+  for (int i = 0; i < req.count; ++i) {
+    munmap(buffers[i], buffer_lengths[i]);
+  }
+
+  return NULL;
+}
+
+int main(int argc, char **argv) {
+  ros::init(argc, argv, "uvc_driver");
+  string params_file = string(argv[1]);
+  ros::NodeHandle nh;
+  image_transport::ImageTransport it(nh);
+  ros::Rate loop_rate(10);
+
+  cv::FileStorage Params(params_file, cv::FileStorage::READ);
+  if (!Params.isOpened()) {
+    string msg = "Failed to open settings file at:" + params_file;
+    ROS_ERROR_STREAM(msg.c_str());
+    exit(-1);
+  }
+
+  trigger_enable = Params["TriggerEnable"];
+  if (!Params["TimestampSource"].empty())
+    timestamp_source = (string)Params["TimestampSource"];
+  if (!Params["Stm32TriggerPath"].empty())
+    stm32_trigger_path = (string)Params["Stm32TriggerPath"];
+  if (!Params["ClockOffsetPath"].empty())
+    clock_offset_path = (string)Params["ClockOffsetPath"];
+  if (!Params["LidarTimeSharePath"].empty())
+    lidar_timeshare_path = (string)Params["LidarTimeSharePath"];
+  string pub_topic = Params["TopicName"];
+  device_name = (string)Params["DeviceName"]; // 从参数文件读取设备名
+
+  pub = it.advertise(pub_topic, 1);
+
+  const char *shared_file_name = stm32_trigger_path.c_str();
+  int fd_time = open(shared_file_name, O_RDONLY);
+  if (fd_time < 0) {
+    ROS_ERROR("Unable to open STM32 trigger timestamp file %s; "
+              "version5 will use ros::Time::now() fallback instead of V4L2 time",
+              shared_file_name);
+    pointt = (volatile time_stamp *)MAP_FAILED;
+  } else {
+    pointt = (volatile time_stamp *)mmap(
+        NULL, sizeof(time_stamp), PROT_READ, MAP_SHARED, fd_time, 0);
+    if (pointt == MAP_FAILED) {
+      ROS_ERROR("Unable to mmap STM32 trigger timestamp file %s; "
+                "version5 will use ros::Time::now() fallback instead of V4L2 time",
+                shared_file_name);
+    }
+    close(fd_time);
+  }
+
+  int fd_offset = open(clock_offset_path.c_str(), O_RDONLY);
+  if (fd_offset < 0) {
+    ROS_WARN("Unable to open MID360 clock offset file %s; fallback will use "
+             "raw ros::Time::now()",
+             clock_offset_path.c_str());
+    clock_offset_pointt = (volatile time_stamp *)MAP_FAILED;
+  } else {
+    clock_offset_pointt = (volatile time_stamp *)mmap(
+        NULL, sizeof(time_stamp), PROT_READ, MAP_SHARED, fd_offset, 0);
+    if (clock_offset_pointt == MAP_FAILED) {
+      ROS_WARN("Unable to mmap MID360 clock offset file %s; fallback will use "
+               "raw ros::Time::now()",
+               clock_offset_path.c_str());
+    }
+    close(fd_offset);
+  }
+
+  int fd_lidar_timeshare = open(lidar_timeshare_path.c_str(), O_RDONLY);
+  if (fd_lidar_timeshare < 0) {
+    ROS_WARN("Unable to open LiDAR timeshare file %s; mid360_trigger_grid "
+             "will use the clock-offset fallback until it is available",
+             lidar_timeshare_path.c_str());
+    lidar_timeshare_pointt = (volatile time_stamp *)MAP_FAILED;
+  } else {
+    lidar_timeshare_pointt = (volatile time_stamp *)mmap(
+        NULL, sizeof(time_stamp), PROT_READ, MAP_SHARED, fd_lidar_timeshare, 0);
+    if (lidar_timeshare_pointt == MAP_FAILED) {
+      ROS_WARN("Unable to mmap LiDAR timeshare file %s; mid360_trigger_grid "
+               "will use the clock-offset fallback until it is available",
+               lidar_timeshare_path.c_str());
+    }
+    close(fd_lidar_timeshare);
+  }
+
+  SetupSignalHandler();
+
+  int fd = open(device_name.c_str(), O_RDWR);
+  if (fd < 0) {
+    perror("open device");
+    ROS_ERROR("Failed to open device %s. Please check permissions or run with sudo.", device_name.c_str());
+    return -1;
+  }
+
+  ROS_INFO("Successfully opened device: %s", device_name.c_str());
+
+  setParams(fd, params_file);
+
+  ROS_INFO("Finish all params set! Start grabbing...");
+
+  pthread_t nThreadID;
+  int ret = pthread_create(&nThreadID, NULL, WorkThread, &fd);
+  if (ret != 0) {
+    printf("thread create failed.ret = %d\n", ret);
+    return -1;
+  }
+
+  while (!exit_flag && ros::ok()) {
+    ros::spinOnce();
+    loop_rate.sleep();
+  }
+
+  if (nThreadID) {
+    pthread_join(nThreadID, NULL);
+    ROS_INFO_STREAM("Worker thread joined.");
+  }
+
+  close(fd);
+  if (pointt != MAP_FAILED) {
+    munmap((void *)pointt, sizeof(time_stamp));
+  }
+
+  return 0;
+}

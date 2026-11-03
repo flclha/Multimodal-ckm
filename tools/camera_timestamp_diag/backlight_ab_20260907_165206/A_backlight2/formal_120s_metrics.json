@@ -1,0 +1,101 @@
+{
+  "group": "A_backlight2",
+  "backlight": 2,
+  "formal_window_seconds": 120.0,
+  "formal_video_frames": 1207,
+  "first_video_sequence": 51,
+  "last_video_sequence": 1257,
+  "video_sequence_jumps": 0,
+  "metadata_pair_sequence_jumps_pts": 0,
+  "metadata_pair_sequence_jumps_scr": 0,
+  "pairing": {
+    "matched": 1207,
+    "video_frames": 1207,
+    "coverage": 1.0,
+    "sequence_offset_mode": -1,
+    "sequence_offset_consistency": 0.7183098591549296,
+    "median_video_minus_payload_ms": -7.930966,
+    "mad_ms": 0.10019199999999984,
+    "minimum_metadata_records": 46
+  },
+  "v4l2": {
+    "samples": 1206,
+    "mean_ms": 99.43617910447762,
+    "std_ms": 1.3935866540273383,
+    "min_ms": 95.767,
+    "max_ms": 100.261,
+    "p50_ms": 99.99,
+    "p95_ms": 100.142,
+    "frequency_hz": 10.056701786070237,
+    "below_97ms": 170,
+    "above_103ms": 0,
+    "duplicates": 0,
+    "rollbacks": 0
+  },
+  "host_dequeue": {
+    "samples": 1206,
+    "mean_ms": 99.43606471724709,
+    "std_ms": 1.3948264876943248,
+    "min_ms": 95.744367,
+    "max_ms": 100.355565,
+    "p50_ms": 99.973115,
+    "p95_ms": 100.17966875,
+    "frequency_hz": 10.056713354893569,
+    "below_97ms": 170,
+    "above_103ms": 0,
+    "duplicates": 0,
+    "rollbacks": 0
+  },
+  "final_header": {
+    "samples": 1206,
+    "mean_ms": 99.43617910447762,
+    "std_ms": 1.3935866540273383,
+    "min_ms": 95.767,
+    "max_ms": 100.261,
+    "p50_ms": 99.99,
+    "p95_ms": 100.142,
+    "frequency_hz": 10.056701786070237,
+    "below_97ms": 170,
+    "above_103ms": 0,
+    "duplicates": 0,
+    "rollbacks": 0
+  },
+  "pts": {
+    "samples": 1206,
+    "mean_ms": 99.4361666839414,
+    "std_ms": 1.786679752206175e-05,
+    "min_ms": 99.43614583333333,
+    "max_ms": 99.4361875,
+    "p50_ms": 99.43616666666667,
+    "p95_ms": 99.4361875,
+    "frequency_hz": 10.05670304224928,
+    "below_97ms": 0,
+    "above_103ms": 0,
+    "duplicates": 0,
+    "rollbacks": 0
+  },
+  "scr": {
+    "samples": 1206,
+    "mean_ms": 99.43615260503041,
+    "std_ms": 0.06248489214912342,
+    "min_ms": 99.37495833333334,
+    "max_ms": 99.50008333333334,
+    "p50_ms": 99.37504166666666,
+    "p95_ms": 99.50004166666666,
+    "frequency_hz": 10.056704466152189,
+    "below_97ms": 0,
+    "above_103ms": 0,
+    "duplicates": 0,
+    "rollbacks": 0
+  },
+  "phase": {
+    "complete_pps_seconds": 119,
+    "frames_per_second_distribution": {
+      "10": 113,
+      "11": 6
+    },
+    "phase_grid_residual_start_ms": 0.0,
+    "phase_grid_residual_end_ms": -679.968,
+    "phase_drift_ms_per_second": -5.6692922097367875
+  }
+}

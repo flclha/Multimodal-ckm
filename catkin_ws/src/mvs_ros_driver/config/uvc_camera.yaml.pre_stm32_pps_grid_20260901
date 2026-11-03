@@ -1,0 +1,38 @@
+%YAML:1.0
+#--------------------------------------------------------------------------------------------
+# UVC Camera Parameters. Adjust them!
+#--------------------------------------------------------------------------------------------
+DeviceName: "/dev/video0"
+TopicName: "uvc_camera/image"
+
+TriggerEnable: 1 # 0 stands for Off, 1 stands for On
+
+# Version5 no-USB mode: V4L2 is image transport only and does not provide time.
+# MID360 is disciplined by STM32 PPS/GPRMC, so its hardware time anchors the
+# STM32 time axis. The camera frame is placed on the same 10 Hz trigger grid.
+TimestampSource: "mid360_trigger_grid"
+Stm32TriggerPath: "/home/nuc/stm32_trigger_time"
+ClockOffsetPath: "/home/nuc/mid360_clock_offset"
+LidarTimeSharePath: "/home/nuc/timeshare"
+TimestampOffsetUs: 0
+Stm32TriggerPeriodUs: 100000
+Stm32TriggerPhaseUs: 0
+Stm32TriggerToExposureCenterUs: 4760
+
+image_scale: 1 # 1 0.5
+
+Width: 1920
+Height: 1080
+PixelFormat: "MJPG"
+FrameRate: 10
+
+# UVC specific parameters
+Backlight: 2 # Set to 2 for hardware trigger
+
+# Exposure settings
+ExposureAutoMode: 0 # Manual: keep every frame's exposure duration deterministic
+Exposure: 156 # Camera manual exposure mode 1: 6 ms
+ExposureTimeLower: 100 # Informational only; not applied by this UVC driver
+ExposureTimeUpper: 10000 # Informational only; not applied by this UVC driver
+
+Gain: 120 # Sensor gain

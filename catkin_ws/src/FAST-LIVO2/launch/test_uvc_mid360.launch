@@ -1,0 +1,39 @@
+<launch>
+<!-- Test launch file for UVC Camera + MID360 LiDAR -->
+
+	<arg name="rviz" default="true" />
+
+	<!-- UVC Camera Driver -->
+	<node
+		pkg="mvs_ros_driver"
+		type="uvc_driver"
+		name="uvc_camera_driver"
+		args="$(find mvs_ros_driver)/config/uvc_camera.yaml"
+		respawn="true"
+		output="screen"
+	/>
+
+	<!-- Livox MID360 LiDAR Driver (需要根据实际配置调整) -->
+	<node
+		pkg="livox_ros_driver2"
+		type="livox_ros_driver2_node"
+		name="livox_lidar_publisher"
+		output="screen"
+	>
+		<param name="xfer_format" type="int" value="1"/>
+		<param name="multi_topic" type="int" value="0"/>
+		<param name="data_src" type="int" value="0"/>
+		<param name="publish_freq" type="double" value="10.0"/>
+		<param name="output_data_type" type="int" value="0"/>
+		<param name="frame_id" type="string" value="livox_frame"/>
+		<param name="user_config_path" type="string" value="livox_lidar_config.json"/>
+	</node>
+
+	<group if="$(arg rviz)">
+		<node launch-prefix="nice" pkg="rviz" type="rviz" name="rviz" args="-d $(find mvs_ros_driver)/rviz_cfg/uvc_camera.rviz" />
+	</group>
+
+	<!-- Image republish for compressed images -->
+	<node pkg="image_transport" type="republish" name="republish" args="compressed in:=/uvc_camera/image raw out:=/uvc_camera/image" output="screen" respawn="true"/>
+
+</launch>

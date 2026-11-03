@@ -1,0 +1,44 @@
+<launch>
+<!-- Launch file for UVC Camera + Livox MID360 LiDAR -->
+
+	<arg name="rviz" default="true" />
+
+	<rosparam command="load" file="$(find fast_livo)/config/uvc_mid360.yaml" />
+
+	<node pkg="fast_livo" type="fastlivo_mapping" name="laserMapping" output="screen">
+		<rosparam file="$(find fast_livo)/config/camera_uvc.yaml" />
+	</node>
+
+	<!-- UVC Camera Driver -->
+	<node
+		pkg="mvs_ros_driver"
+		type="uvc_driver"
+		name="uvc_camera_driver"
+		args="$(find mvs_ros_driver)/config/uvc_camera.yaml"
+		respawn="true"
+		output="screen"
+	/>
+
+	<!-- Livox MID360 LiDAR Driver (需要根据实际配置调整) -->
+	<!-- 如果使用livox_ros_driver2 -->
+	<include file="$(find livox_ros_driver2)/launch_ROS1/msg_MID360.launch" />
+
+	<!-- 如果使用livox_ros_driver -->
+	<!-- <include file="$(find livox_ros_driver)/launch/livox_lidar.launch">
+		<arg name="bd_list" value="your_livox_device_id"/>
+		<arg name="xfer_format" value="1"/>
+		<arg name="multi_topic" value="0"/>
+		<arg name="data_src" value="0"/>
+		<arg name="publish_freq" value="10.0"/>
+		<arg name="output_data_type" value="0"/>
+		<arg name="frame_id" value="livox_frame"/>
+	</include> -->
+
+	<group if="$(arg rviz)">
+		<node launch-prefix="nice" pkg="rviz" type="rviz" name="rviz" args="-d $(find fast_livo)/rviz_cfg/fast_livo2.rviz" />
+	</group>
+
+	<!-- Image republish for compressed images -->
+	<node pkg="image_transport" type="republish" name="republish" args="compressed in:=/uvc_camera/image raw out:=/uvc_camera/image" output="screen" respawn="true"/>
+
+</launch>

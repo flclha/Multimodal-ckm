@@ -1,0 +1,17 @@
+<launch>
+  <!-- Full LIVO offline replay: camera+LiDAR+IMU, no drivers/RViz/PCD export. -->
+  <arg name="innovation_csv_path" required="true" />
+
+  <rosparam command="load" file="$(find fast_livo)/config/uvc_mid360.yaml" />
+  <param name="common/img_en" type="int" value="1" />
+  <param name="common/lidar_en" type="int" value="1" />
+  <param name="imu/imu_en" type="bool" value="true" />
+  <param name="pcd_save/pcd_save_en" type="bool" value="false" />
+  <param name="pcd_save/colmap_output_en" type="bool" value="false" />
+  <param name="lio/innovation_diag_en" type="bool" value="true" />
+  <param name="lio/innovation_csv_path" type="string" value="$(arg innovation_csv_path)" />
+
+  <node pkg="fast_livo" type="fastlivo_mapping" name="laserMapping" output="screen">
+    <rosparam file="$(find fast_livo)/config/camera_uvc.yaml" />
+  </node>
+</launch>

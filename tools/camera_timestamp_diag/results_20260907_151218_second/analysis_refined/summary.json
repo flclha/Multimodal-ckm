@@ -1,0 +1,122 @@
+{
+  "statistics": {
+    "v4l2_buf_timestamp": {
+      "samples": 1256,
+      "mean_ms": 99.43625955414012,
+      "std_ms": 1.3866180347707127,
+      "min_ms": 95.749,
+      "max_ms": 100.297,
+      "p50_ms": 99.99,
+      "p95_ms": 100.156,
+      "frequency_hz": 10.056693649619126,
+      "below_97ms": 177,
+      "above_103ms": 0,
+      "duplicates": 0,
+      "rollbacks": 0
+    },
+    "pts_48mhz": {
+      "samples": 1256,
+      "mean_ms": 99.43616666666667,
+      "std_ms": 1.6751047017831288e-05,
+      "min_ms": 99.43614583333333,
+      "max_ms": 99.4361875,
+      "p50_ms": 99.43616666666667,
+      "p95_ms": 99.4361875,
+      "frequency_hz": 10.0567030439964,
+      "below_97ms": 0,
+      "above_103ms": 0,
+      "duplicates": 0,
+      "rollbacks": 0
+    },
+    "scr_stc_48mhz": {
+      "samples": 1256,
+      "mean_ms": 99.43620624336519,
+      "std_ms": 0.062486811554600015,
+      "min_ms": 99.3749375,
+      "max_ms": 99.5000625,
+      "p50_ms": 99.37504166666666,
+      "p95_ms": 99.50004166666666,
+      "frequency_hz": 10.056699041318506,
+      "below_97ms": 0,
+      "above_103ms": 0,
+      "duplicates": 0,
+      "rollbacks": 0
+    },
+    "metadata_first_payload_host": {
+      "samples": 1256,
+      "mean_ms": 99.43634602786624,
+      "std_ms": 1.3803379533688067,
+      "min_ms": 95.887056,
+      "max_ms": 100.184565,
+      "p50_ms": 99.9904255,
+      "p95_ms": 100.08257325,
+      "frequency_hz": 10.056684903925955,
+      "below_97ms": 177,
+      "above_103ms": 0,
+      "duplicates": 0,
+      "rollbacks": 0
+    },
+    "usb_host_sof": {
+      "samples": 1256,
+      "mean_ms": 99.43630573248407,
+      "std_ms": 1.391770758003408,
+      "min_ms": 96.0,
+      "max_ms": 100.0,
+      "p50_ms": 100.0,
+      "p95_ms": 100.0,
+      "frequency_hz": 10.056688979278096,
+      "below_97ms": 177,
+      "above_103ms": 0,
+      "duplicates": 0,
+      "rollbacks": 0
+    },
+    "host_dequeue_monotonic": {
+      "samples": 1256,
+      "mean_ms": 99.43644179140126,
+      "std_ms": 1.383569569433983,
+      "min_ms": 95.682153,
+      "max_ms": 100.3692,
+      "p50_ms": 99.9828305,
+      "p95_ms": 100.17496325,
+      "frequency_hz": 10.05667521870714,
+      "below_97ms": 177,
+      "above_103ms": 0,
+      "duplicates": 0,
+      "rollbacks": 0
+    },
+    "final_image_header": {
+      "samples": 1256,
+      "mean_ms": 99.43625955414012,
+      "std_ms": 1.3866180347707127,
+      "min_ms": 95.749,
+      "max_ms": 100.297,
+      "p50_ms": 99.99,
+      "p95_ms": 100.156,
+      "frequency_hz": 10.056693649619126,
+      "below_97ms": 177,
+      "above_103ms": 0,
+      "duplicates": 0,
+      "rollbacks": 0
+    }
+  },
+  "diagnostics": {
+    "video_frames": 1257,
+    "metadata_buffers": 1258,
+    "video_sequence_jumps": 0,
+    "metadata_sequence_jumps": 0,
+    "metadata_missing_pts": 0,
+    "metadata_missing_scr": 0,
+    "pairing": {
+      "method": "nearest same-clock payload timestamp with monotonic one-to-one sequence validation",
+      "sequence_offset_video_minus_metadata_mode": 30,
+      "sequence_offset_consistency": 1.0,
+      "matched_pairs": 1257,
+      "coverage": 0.9992050874403816,
+      "median_video_minus_first_payload_ms": -7.907824,
+      "mad_ms": 0.12017399999999956,
+      "max_abs_residual_ms": 8.171915,
+      "reliable": true
+    }
+  },
+  "anomaly_count_95_to_97ms": 177
+}

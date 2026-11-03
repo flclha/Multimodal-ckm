@@ -1,0 +1,45 @@
+%YAML:1.0
+#--------------------------------------------------------------------------------------------
+# UVC Camera Parameters. Adjust them!
+#--------------------------------------------------------------------------------------------
+DeviceName: "/dev/video0"
+TopicName: "uvc_camera/image"
+
+TriggerEnable: 1 # 0 stands for Off, 1 stands for On
+
+# Version5 no-USB mode. STM32 PPS/GPRMC is the master clock. MID360 hardware
+# time is used only to identify the PPS integer-second anchor; a LiDAR frame
+# timestamp is never reused as a Camera Trigger. V4L2 supplies image data and
+# frame sequence only, not time.
+TimestampSource: "stm32_pps_phase_grid"
+Stm32TriggerPath: "/home/nuc/stm32_trigger_time"
+ClockOffsetPath: "/home/nuc/mid360_clock_offset"
+LidarTimeSharePath: "/home/nuc/timeshare"
+TimestampOffsetUs: 0
+Stm32TriggerPeriodUs: 100000
+# Firmware-derived initial hypothesis only. Scan this value with dynamic data
+# until PA1/STRB can be measured. It is not a hardware-verified phi.
+Stm32TriggerPhaseUs: 100
+# Shift the first Camera frame by whole trigger periods when testing a possible
+# +/-100 ms first-frame association error.
+Stm32TriggerInitialFrameOffset: 0
+Stm32SequenceResetThreshold: 100
+Stm32TriggerToExposureCenterUs: 4760
+
+image_scale: 1 # 1 0.5
+
+Width: 1920
+Height: 1080
+PixelFormat: "MJPG"
+FrameRate: 10
+
+# UVC specific parameters
+Backlight: 2 # Set to 2 for hardware trigger
+
+# Exposure settings
+ExposureAutoMode: 0 # Manual: keep every frame's exposure duration deterministic
+Exposure: 156 # Camera manual exposure mode 1: 6 ms
+ExposureTimeLower: 100 # Informational only; not applied by this UVC driver
+ExposureTimeUpper: 10000 # Informational only; not applied by this UVC driver
+
+Gain: 120 # Sensor gain

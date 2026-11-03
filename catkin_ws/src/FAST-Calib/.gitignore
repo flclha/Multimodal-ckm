@@ -1,0 +1,20 @@
+calib_data/*
+calib_databackup/
+output/*
+build/*
+devel/
+install/
+
+# Generated Python/cache files
+__pycache__/
+*.py[cod]
+
+# Local backups and heavy calibration captures/results
+*.bak
+*.bak_*
+*.bag
+*.pcd
+*.ply
+*.las
+*.jpg
+*.png

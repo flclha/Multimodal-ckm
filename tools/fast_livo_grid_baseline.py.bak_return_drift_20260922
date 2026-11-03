@@ -1,0 +1,211 @@
+#!/usr/bin/env python3
+"""FAST-LIVO 0.6 m 网格定位精度交互式测量工具。"""
+
+import argparse
+import csv
+import math
+import os
+import socket
+import statistics
+import sys
+import threading
+import time
+import xmlrpc.client
+from collections import deque
+from datetime import datetime
+import rospy
+from nav_msgs.msg import Odometry
+
+
+def check_ros_master(timeout=3.0):
+    """在创建 ROS 节点前检查 master，避免只看到难以理解的注册失败提示。"""
+    master_uri = os.environ.get("ROS_MASTER_URI", "http://localhost:11311")
+    old_timeout = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(timeout)
+    try:
+        master = xmlrpc.client.ServerProxy(master_uri)
+        code, message, _ = master.getPid("/fast_livo_grid_baseline_preflight")
+        if code != 1:
+            raise RuntimeError("ROS master 返回异常：{}".format(message))
+    except (OSError, xmlrpc.client.Error) as exc:
+        raise RuntimeError(
+            "无法连接 ROS master ({})。请先运行 Version5 的 start_slam1，"
+            "等待定位和 RViz 启动完成后，再运行本工具。原始错误：{}".format(
+                master_uri, exc
+            )
+        )
+    finally:
+        socket.setdefaulttimeout(old_timeout)
+    return master_uri
+
+
+class Baseline:
+    """接收 FAST-LIVO 位姿，并完成单段与累计距离误差统计。"""
+
+    def __init__(self, topic, grid, window, out_dir):
+        """保存测量参数，初始化位姿缓存和结果文件状态。"""
+        self.topic, self.grid, self.window = topic, grid, window
+        self.out_dir = out_dir
+        self.lock = threading.Lock()
+        # 最多缓存 10000 个位姿，供静止窗口取样和中位数估计。
+        self.samples = deque(maxlen=10000)
+        # 保存上一帧位置，用于估计连续轨迹长度。
+        self.last = None
+        # 累积每相邻两帧 XY 位移，作为辅助轨迹长度，不替代 A 点测距。
+        self.raw_path = 0.0
+        self.points = []
+        self.file = self.writer = None
+
+    def callback(self, msg):
+        """位姿回调：缓存坐标、时间戳，并累加相邻帧的 XY 路程。"""
+        p = msg.pose.pose.position
+        # 提取当前位姿，计算它与上一帧之间的水平距离。
+        xyz = (float(p.x), float(p.y), float(p.z))
+        with self.lock:
+            if self.last:
+                self.raw_path += math.hypot(xyz[0]-self.last[0], xyz[1]-self.last[1])
+            self.last = xyz
+            self.samples.append((time.monotonic(), msg.header.stamp.to_sec(), *xyz))
+
+    def wait(self):
+        """等待第一条有效里程计消息，确认 FAST-LIVO 位姿 topic 已经发布。"""
+        print("等待位姿 {} ...".format(self.topic), flush=True)
+        try:
+            rospy.wait_for_message(self.topic, Odometry, timeout=30)
+        except rospy.ROSException:
+            raise RuntimeError(
+                "ROS master 已连接，但 30 秒内没有收到 {}。"
+                "请确认 Version5 SLAM 已完成启动，且 topic 名称正确。".format(self.topic)
+            )
+        time.sleep(0.2)
+
+    def open_csv(self):
+        """创建本次测量目录和 CSV，所有 A 点结果都会即时落盘。"""
+        os.makedirs(self.out_dir, exist_ok=True)
+        path = os.path.join(self.out_dir, "grid_baseline.csv")
+        self.file = open(path, "w", newline="", buffering=1)
+        names = ["index", "time", "pose_stamp", "x", "y", "z", "samples",
+                 "stationary_spread", "segment_xy", "segment_3d", "segment_error",
+                 "segment_error_pct", "cumulative_xy", "expected", "cumulative_error",
+                 "cumulative_error_pct", "raw_path_since_a"]
+        self.writer = csv.DictWriter(self.file, fieldnames=names)
+        self.writer.writeheader()
+        return path
+
+    def stationary(self):
+        """静止采样 window 秒，以坐标中位数作为当前稳定位置。"""
+        print("保持完全静止，采样 {:.1f} 秒...".format(self.window), flush=True)
+        start = time.monotonic()
+        time.sleep(self.window)
+        end = time.monotonic()
+        with self.lock:
+            rows = [r for r in self.samples if start <= r[0] <= end]
+            raw = self.raw_path
+        if len(rows) < 5:
+            raise RuntimeError("静止窗口仅收到 {} 个位姿".format(len(rows)))
+        x = statistics.median(r[2] for r in rows)
+        y = statistics.median(r[3] for r in rows)
+        z = statistics.median(r[4] for r in rows)
+        return {"time": datetime.now().astimezone().isoformat(timespec="milliseconds"),
+                "stamp": statistics.median(r[1] for r in rows), "x": x, "y": y, "z": z,
+                "samples": len(rows),
+                "spread": max(math.hypot(r[2]-x, r[3]-y) for r in rows), "raw": raw}
+
+    def mark(self):
+        """用户输入 A 时记录稳定点，并计算上一网格段和累计距离误差。"""
+        p = self.stationary(); p["index"] = len(self.points)
+        if not self.points:
+            p.update(seg=0.0, seg3=0.0, err=0.0, err_pct=0.0, cum=0.0,
+                     expected=0.0, cum_err=0.0, cum_pct=0.0, raw_seg=0.0)
+            self.points.append(p); self.save(p)
+            print("\n[A] 起点#0 x={:.4f} y={:.4f} z={:.4f} m，静止抖动 {:.2f} mm".format(
+                  p["x"], p["y"], p["z"], p["spread"]*1000))
+            print("移动一个0.6m网格、停稳，再输入A。"); return
+        old = self.points[-1]
+        dx, dy, dz = p["x"]-old["x"], p["y"]-old["y"], p["z"]-old["z"]
+        seg = math.hypot(dx, dy); seg3 = math.sqrt(dx*dx+dy*dy+dz*dz)
+        expected = p["index"] * self.grid; cum = old["cum"] + seg
+        p.update(seg=seg, seg3=seg3, err=seg-self.grid,
+                 err_pct=(seg-self.grid)/self.grid*100, cum=cum, expected=expected,
+                 cum_err=cum-expected, cum_pct=(cum-expected)/expected*100,
+                 raw_seg=p["raw"]-old["raw"])
+        self.points.append(p); self.save(p)
+        print("\n[A] 第{}段：真值 {:.4f} m，定位 {:.4f} m".format(p["index"], self.grid, seg))
+        print("  本段误差 {:+.4f} m ({:+.2f}%)，dz={:+.4f} m".format(p["err"], p["err_pct"], dz))
+        print("  累计真值 {:.4f} m，定位 {:.4f} m，误差 {:+.4f} m ({:+.2f}%)".format(
+              expected, cum, p["cum_err"], p["cum_pct"]))
+        print("  静止抖动 {:.2f} mm".format(p["spread"]*1000))
+
+    def save(self, p):
+        """把一个 A 点及其误差指标写入 CSV，并立即刷新到磁盘。"""
+        self.writer.writerow({"index": p["index"], "time": p["time"], "pose_stamp": p["stamp"],
+            "x": p["x"], "y": p["y"], "z": p["z"], "samples": p["samples"],
+            "stationary_spread": p["spread"], "segment_xy": p["seg"], "segment_3d": p["seg3"],
+            "segment_error": p["err"], "segment_error_pct": p["err_pct"],
+            "cumulative_xy": p["cum"], "expected": p["expected"],
+            "cumulative_error": p["cum_err"], "cumulative_error_pct": p["cum_pct"],
+            "raw_path_since_a": p["raw_seg"]}); self.file.flush()
+        
+
+    def report(self):
+        """用户输入 B 时汇总所有已记录网格段的长期累计误差。"""
+        n = len(self.points)-1
+        if n < 1: print("[B] 至少需要起点和一个终点（两次A）"); return
+        expected, measured = n*self.grid, self.points[-1]["cum"]
+        errors = [p["err"] for p in self.points[1:]]
+        mae = sum(abs(e) for e in errors)/n
+        rmse = math.sqrt(sum(e*e for e in errors)/n)
+        print("\n[B] 长期累计定位精度：{}个0.6m路段".format(n))
+        print("  理论/定位累计：{:.4f} / {:.4f} m".format(expected, measured))
+        print("  累计误差：{:+.4f} m ({:+.2f}%)".format(measured-expected, (measured-expected)/expected*100))
+        print("  单段 MAE/RMSE：{:.4f} / {:.4f} m；最大误差 {:+.4f} m".format(
+              mae, rmse, max(errors, key=abs)))
+
+    def status(self):
+        """用户输入 S 时显示最新位置、接收延迟和已记录 A 点数。"""
+        with self.lock: row = self.samples[-1] if self.samples else None
+        if not row: print("[S] 无位姿"); return
+        print("[S] x={:.4f} y={:.4f} z={:.4f} m，延迟{:.3f}s，A点{}".format(
+              row[2], row[3], row[4], time.monotonic()-row[0], len(self.points)))
+
+
+def main():
+    """解析参数、完成 ROS 预检，然后进入 A/B/S/Q 交互循环。"""
+    ap = argparse.ArgumentParser(description="FAST-LIVO 0.6m网格定位精度baseline")
+    ap.add_argument("--topic", default="/aft_mapped_to_init")
+    ap.add_argument("--grid", type=float, default=0.6)
+    ap.add_argument("--sample-seconds", type=float, default=1.0)
+    args = ap.parse_args()
+    out = os.path.expanduser("~/fast_livo_baseline/" + datetime.now().strftime("%Y%m%d_%H%M%S"))
+    try:
+        master_uri = check_ros_master()
+        print("ROS master 已连接：{}".format(master_uri), flush=True)
+        rospy.init_node("fast_livo_grid_baseline", anonymous=True, disable_signals=True)
+    except (RuntimeError, rospy.ROSException) as exc:
+        print("ERROR: {}".format(exc), file=sys.stderr)
+        return 2
+
+    tool = Baseline(args.topic, args.grid, args.sample_seconds, out)
+    sub = rospy.Subscriber(args.topic, Odometry, tool.callback, queue_size=2000)
+    try:
+        tool.wait(); path = tool.open_csv()
+        print("就绪：起点输入A；每移动0.6m并停稳后输入A；输入B查看累计误差。")
+        print("A=记录 B=累计 S=状态 Q=退出；CSV={}".format(path))
+        while not rospy.is_shutdown():
+            cmd = input("baseline> ").strip().upper()
+            if cmd == "A":
+                try: tool.mark()
+                except RuntimeError as e: print("[A]失败：{}".format(e))
+            elif cmd == "B": tool.report()
+            elif cmd == "S": tool.status()
+            elif cmd in ("Q", "QUIT", "EXIT"): break
+            elif cmd: print("请输入A、B、S或Q")
+    except (KeyboardInterrupt, EOFError): print("\n退出")
+    except RuntimeError as e: print("ERROR: {}".format(e), file=sys.stderr); return 2
+    finally:
+        sub.unregister()
+        if tool.file: tool.file.close()
+    return 0
+
+
+if __name__ == "__main__": sys.exit(main())

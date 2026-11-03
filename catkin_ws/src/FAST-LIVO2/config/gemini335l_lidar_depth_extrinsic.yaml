@@ -1,0 +1,35 @@
+# Gemini 335L depth camera pose in the live FAST-LIVO state frame.
+# Generated 2026-10-27 from:
+#   1) accepted Gemini RGB <- LiDAR calibration;
+#   2) Gemini factory RGB <- Depth calibration;
+#   3) Version5 LiDAR -> IMU extrinsic in uvc_mid360.yaml.
+#
+# ROS TF convention used below:
+#   p_aft_mapped = R_parent_child * p_gemini_link + t_parent_child
+parent_frame: aft_mapped
+child_frame: gemini335l_link
+translation_m: [0.07098540, 0.03218597, -0.00990400]
+quaternion_xyzw: [0.0024645699, -0.1750861673, -0.0004425972, 0.9845499313]
+rotation_parent_child:
+  [0.938689249, 0.000008494, -0.344764338,
+   -0.001734542, 0.999987482, -0.004697999,
+   0.344759958, 0.005007970, 0.938677538]
+
+# Traceable source transform: p_depth_optical = R * p_lidar + t.
+lidar_to_depth_optical:
+  rotation:
+    [-0.000008494, -0.999987482, -0.005007970,
+      0.344764338,  0.004697999, -0.938677538,
+      0.938689249, -0.001734542,  0.344759958]
+  translation_m: [0.0552054154, -0.0792373833, -0.0582372821]
+
+# Version5 convention: p_imu = R_imu_lidar * p_lidar + t_imu_lidar.
+lidar_to_imu:
+  rotation: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+  translation_m: [-0.011, -0.02329, 0.04412]
+
+source_calibration: /home/nuc/gemini335l_lidar_calibration/20261027_155641/result/accepted_lidar_to_depth.yaml
+quality_in_rgb_frame:
+  three_d_rmse_mm: 5.2555158704
+  pixel_rmse_px: 1.2862848930
+

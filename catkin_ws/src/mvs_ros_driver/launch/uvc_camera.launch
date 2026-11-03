@@ -1,0 +1,18 @@
+<launch>
+  <node
+    pkg="mvs_ros_driver"
+    type="uvc_driver"
+    name="uvc_camera_driver"
+    args="$(find mvs_ros_driver)/config/uvc_camera.yaml"
+    respawn="true"
+    output="screen"
+  />
+
+ <node
+    pkg="rviz"
+    type="rviz"
+    name="rviz"
+    args="-d $(find mvs_ros_driver)/rviz_cfg/uvc_camera.rviz"
+  />
+
+</launch>

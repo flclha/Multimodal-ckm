@@ -1,0 +1,56 @@
+<launch>
+  <!-- Offline replay only: sensor drivers and RViz are intentionally absent. -->
+  <arg name="pcd_output_dir" required="true" />
+  <arg name="pcd_interval" default="200" />
+  <arg name="ground_velocity_constraint_en" default="false" />
+  <arg name="ground_velocity_constraint_post_vio_en" default="false" />
+  <arg name="vio_velocity_delta_diag_en" default="false" />
+  <arg name="vio_velocity_delta_guard_en" default="false" />
+  <arg name="vio_velocity_delta_guard_trigger" default="0.040" />
+  <arg name="vio_velocity_delta_guard_limit" default="0.040" />
+  <arg name="vio_velocity_delta_guard_min_stable_frames" default="3" />
+  <arg name="prediction_start_velocity_delta_diag_en" default="false" />
+  <arg name="prediction_start_velocity_delta_guard_en" default="false" />
+  <arg name="prediction_start_velocity_delta_guard_trigger" default="0.100" />
+  <arg name="prediction_start_velocity_delta_guard_limit" default="0.070" />
+  <arg name="prediction_start_velocity_delta_guard_min_stable_frames" default="3" />
+  <arg name="ground_velocity_sigma" default="0.06" />
+  <arg name="ground_velocity_post_vio_min_velocity_change" default="0.001" />
+  <arg name="prediction_ground_displacement_constraint_en" default="false" />
+  <arg name="prediction_ground_displacement_sigma" default="0.010" />
+  <arg name="prediction_ground_displacement_trigger" default="0.010" />
+  <arg name="prediction_ground_displacement_max_abs" default="0.060" />
+  <arg name="prediction_ground_displacement_max_correction" default="0.015" />
+  <arg name="prediction_ground_displacement_correction_gain" default="0.50" />
+  <arg name="innovation_csv_path" default="/home/nuc/versions/version5/logs/lio_innovation_offline.csv" />
+
+  <rosparam command="load" file="$(find fast_livo)/config/uvc_mid360.yaml" />
+  <param name="lio/ground_velocity_constraint_en" type="bool" value="$(arg ground_velocity_constraint_en)" />
+  <param name="lio/ground_velocity_constraint_post_vio_en" type="bool" value="$(arg ground_velocity_constraint_post_vio_en)" />
+  <param name="lio/vio_velocity_delta_diag_en" type="bool" value="$(arg vio_velocity_delta_diag_en)" />
+  <param name="lio/vio_velocity_delta_guard_en" type="bool" value="$(arg vio_velocity_delta_guard_en)" />
+  <param name="lio/vio_velocity_delta_guard_trigger" type="double" value="$(arg vio_velocity_delta_guard_trigger)" />
+  <param name="lio/vio_velocity_delta_guard_limit" type="double" value="$(arg vio_velocity_delta_guard_limit)" />
+  <param name="lio/vio_velocity_delta_guard_min_stable_frames" type="int" value="$(arg vio_velocity_delta_guard_min_stable_frames)" />
+  <param name="lio/prediction_start_velocity_delta_diag_en" type="bool" value="$(arg prediction_start_velocity_delta_diag_en)" />
+  <param name="lio/prediction_start_velocity_delta_guard_en" type="bool" value="$(arg prediction_start_velocity_delta_guard_en)" />
+  <param name="lio/prediction_start_velocity_delta_guard_trigger" type="double" value="$(arg prediction_start_velocity_delta_guard_trigger)" />
+  <param name="lio/prediction_start_velocity_delta_guard_limit" type="double" value="$(arg prediction_start_velocity_delta_guard_limit)" />
+  <param name="lio/prediction_start_velocity_delta_guard_min_stable_frames" type="int" value="$(arg prediction_start_velocity_delta_guard_min_stable_frames)" />
+  <param name="lio/ground_velocity_sigma" type="double" value="$(arg ground_velocity_sigma)" />
+  <param name="lio/ground_velocity_post_vio_min_velocity_change" type="double" value="$(arg ground_velocity_post_vio_min_velocity_change)" />
+  <param name="lio/prediction_ground_displacement_constraint_en" type="bool" value="$(arg prediction_ground_displacement_constraint_en)" />
+  <param name="lio/prediction_ground_displacement_sigma" type="double" value="$(arg prediction_ground_displacement_sigma)" />
+  <param name="lio/prediction_ground_displacement_trigger" type="double" value="$(arg prediction_ground_displacement_trigger)" />
+  <param name="lio/prediction_ground_displacement_max_abs" type="double" value="$(arg prediction_ground_displacement_max_abs)" />
+  <param name="lio/prediction_ground_displacement_max_correction" type="double" value="$(arg prediction_ground_displacement_max_correction)" />
+  <param name="lio/prediction_ground_displacement_correction_gain" type="double" value="$(arg prediction_ground_displacement_correction_gain)" />
+  <param name="lio/innovation_csv_path" type="string" value="$(arg innovation_csv_path)" />
+  <param name="pcd_save/output_dir" type="string" value="$(arg pcd_output_dir)" />
+  <param name="pcd_save/interval" type="int" value="$(arg pcd_interval)" />
+  <param name="pcd_save/colmap_output_en" type="bool" value="false" />
+
+  <node pkg="fast_livo" type="fastlivo_mapping" name="laserMapping" output="screen">
+    <rosparam file="$(find fast_livo)/config/camera_uvc.yaml" />
+  </node>
+</launch>

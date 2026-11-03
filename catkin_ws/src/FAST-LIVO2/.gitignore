@@ -1,0 +1,20 @@
+Log/*
+build/*
+devel/
+install/
+
+# Generated Python/cache files
+__pycache__/
+*.py[cod]
+
+# Local backups and editor state
+*.bak
+*.bak_*
+*.tmp
+*~
+
+# Mapping outputs
+*.pcd
+*.ply
+*.las
+*.bag

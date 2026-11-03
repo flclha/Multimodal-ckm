@@ -1,0 +1,55 @@
+<launch>
+  <!-- Live mapping: sensor drivers are already running (/livox/lidar and /uvc_camera/image). -->
+  <arg name="rviz" default="true" />
+  <arg name="rviz_multiview" default="false" />
+  <arg name="pcd_output_dir" default="$(find fast_livo)/Log/PCD" />
+  <arg name="innovation_csv_path" default="/home/nuc/versions/version5/logs/manual/lio_innovation.csv" />
+  <arg name="colmap_output" default="true" />
+  <arg name="car_tf" default="true" />
+  <arg name="gemini_depth_tf" default="true" />
+  <arg name="mid360_frame" default="aft_mapped" />
+  <arg name="car_frame" default="tracer_base" />
+
+  <rosparam command="load" file="$(find fast_livo)/config/uvc_mid360.yaml" />
+  <param name="pcd_save/output_dir" type="string" value="$(arg pcd_output_dir)" />
+  <param name="pcd_save/colmap_output_en" type="bool" value="$(arg colmap_output)" />
+  <param name="lio/innovation_csv_path" type="string" value="$(arg innovation_csv_path)" />
+
+  <node pkg="fast_livo" type="fastlivo_mapping" name="laserMapping" output="screen">
+    <rosparam file="$(find fast_livo)/config/camera_uvc.yaml" />
+  </node>
+
+  <node if="$(arg car_tf)" pkg="fast_livo" type="mid360_to_car_tf.py" name="mid360_to_car_tf" output="screen">
+    <param name="odom_topic" type="string" value="/aft_mapped_to_init" />
+    <param name="mid360_frame" type="string" value="$(arg mid360_frame)" />
+    <param name="car_frame" type="string" value="$(arg car_frame)" />
+    <rosparam param="heading_axis">[1.0, 0.0, 0.0]</rosparam>
+    <param name="yaw_offset_deg" type="double" value="0.0" />
+    <param name="use_initial_mount_calibration" type="bool" value="true" />
+  </node>
+
+  <!-- Connect the Gemini factory RGB/Depth TF tree to the moving FAST-LIVO
+       state frame. The YAML is derived from the accepted LiDAR->RGB result
+       and the camera's factory Depth->RGB transform. -->
+  <group if="$(arg gemini_depth_tf)">
+    <node pkg="fast_livo" type="gemini335l_extrinsic_tf.py"
+          name="gemini335l_extrinsic_tf" output="screen">
+      <rosparam command="load"
+                file="$(find fast_livo)/config/gemini335l_lidar_depth_extrinsic.yaml" />
+    </node>
+  </group>
+
+  <group if="$(arg rviz)">
+    <node launch-prefix="nice" pkg="rviz" type="rviz" name="rviz" args="-d $(find fast_livo)/rviz_cfg/fast_livo2.rviz" />
+  </group>
+
+  <!-- Recording/demo layout: one uncolored-LiDAR RViz window and one RGB-map
+       RViz window. The camera image is docked inside the RGB-map window. Both
+       instances run at low priority and use queue-size-one displays. -->
+  <group if="$(arg rviz_multiview)">
+    <node launch-prefix="nice -n 10" pkg="rviz" type="rviz" name="rviz_raw_map"
+          args="-d $(find fast_livo)/rviz_cfg/fast_livo2_raw_map.rviz" />
+    <node launch-prefix="nice -n 10" pkg="rviz" type="rviz" name="rviz_rgb_map"
+          args="-d $(find fast_livo)/rviz_cfg/fast_livo2_rgb_map.rviz" />
+  </group>
+</launch>

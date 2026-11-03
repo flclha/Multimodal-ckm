@@ -1,0 +1,94 @@
+{
+  "statistics": {
+    "v4l2_buf_timestamp": {
+      "samples": 1256,
+      "mean_ms": 99.43625955414012,
+      "std_ms": 1.3866180347707127,
+      "min_ms": 95.749,
+      "max_ms": 100.297,
+      "p50_ms": 99.99,
+      "p95_ms": 100.156,
+      "frequency_hz": 10.056693649619126,
+      "below_97ms": 177,
+      "above_103ms": 0,
+      "duplicates": 0,
+      "rollbacks": 0
+    },
+    "pts_48mhz": {
+      "samples": 1257,
+      "mean_ms": 99.43616665009282,
+      "std_ms": 1.675468179712507e-05,
+      "min_ms": 99.43614583333333,
+      "max_ms": 99.4361875,
+      "p50_ms": 99.43616666666667,
+      "p95_ms": 99.4361875,
+      "frequency_hz": 10.056703045672634,
+      "below_97ms": 0,
+      "above_103ms": 0,
+      "duplicates": 0,
+      "rollbacks": 0
+    },
+    "scr_stc_48mhz": {
+      "samples": 1257,
+      "mean_ms": 99.41746224476267,
+      "std_ms": 0.6672191354778674,
+      "min_ms": 75.875,
+      "max_ms": 99.5000625,
+      "p50_ms": 99.37504166666666,
+      "p95_ms": 99.50004166666666,
+      "frequency_hz": 10.058595114186593,
+      "below_97ms": 1,
+      "above_103ms": 0,
+      "duplicates": 0,
+      "rollbacks": 0
+    },
+    "host_dequeue_monotonic": {
+      "samples": 1256,
+      "mean_ms": 99.43644179140126,
+      "std_ms": 1.383569569433983,
+      "min_ms": 95.682153,
+      "max_ms": 100.3692,
+      "p50_ms": 99.9828305,
+      "p95_ms": 100.17496325,
+      "frequency_hz": 10.05667521870714,
+      "below_97ms": 177,
+      "above_103ms": 0,
+      "duplicates": 0,
+      "rollbacks": 0
+    },
+    "final_image_header": {
+      "samples": 1256,
+      "mean_ms": 99.43625955414012,
+      "std_ms": 1.3866180347707127,
+      "min_ms": 95.749,
+      "max_ms": 100.297,
+      "p50_ms": 99.99,
+      "p95_ms": 100.156,
+      "frequency_hz": 10.056693649619126,
+      "below_97ms": 177,
+      "above_103ms": 0,
+      "duplicates": 0,
+      "rollbacks": 0
+    }
+  },
+  "diagnostics": {
+    "video_frames": 1257,
+    "metadata_buffers": 1258,
+    "video_sequence_jumps": 0,
+    "metadata_sequence_jumps": 0,
+    "metadata_missing_pts": 0,
+    "metadata_missing_scr": 0,
+    "pairing": {
+      "method": "nearest same-clock payload timestamp with monotonic one-to-one sequence validation",
+      "sequence_offset_video_minus_metadata_mode": 30,
+      "sequence_offset_consistency": 1.0,
+      "matched_pairs": 1257,
+      "coverage": 0.9992050874403816,
+      "median_video_minus_first_payload_ms": -7.907824,
+      "mad_ms": 0.12017399999999956,
+      "max_abs_residual_ms": 8.171915,
+      "reliable": true
+    }
+  },
+  "anomaly_count_95_to_97ms": 177
+}
